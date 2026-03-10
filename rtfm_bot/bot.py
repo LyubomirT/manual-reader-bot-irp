@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 from typing import Any
 
@@ -27,10 +28,12 @@ from rtfm_bot.storage import (
     ConversationStore,
     UserBan,
 )
+from rtfm_bot.statuses import BotStatusSpec, DEFAULT_ROTATING_STATUSES, choose_next_status
 
 LOGGER = logging.getLogger(__name__)
 MAX_MEMORY_SCOPE_OPTIONS = 25
 MEMORY_VIEW_TIMEOUT_SECONDS = 300
+INITIAL_STATUS_UPDATE_DELAY_SECONDS = 5
 AI_BAN_BLOCK_MESSAGE = "You're blocked from using Reader of the Manual now."
 AI_BAN_NOTICE_MESSAGE = (
     "The AI blocked you for suspected abuse, weird messaging, or wasting the owner's tokens. "
@@ -320,6 +323,9 @@ class ReaderBot(commands.Bot):
             window_seconds=config.global_rate_limit_window_seconds,
         )
         self._cache_refresh_task: asyncio.Task[None] | None = None
+        self._status_rotation_task: asyncio.Task[None] | None = None
+        self._status_random = random.Random()
+        self._current_status: BotStatusSpec | None = None
         self._register_commands()
 
     async def setup_hook(self) -> None:
@@ -346,6 +352,10 @@ class ReaderBot(commands.Bot):
             self._cache_refresh_loop(),
             name="docs-cache-refresh-loop",
         )
+        self._status_rotation_task = asyncio.create_task(
+            self._status_rotation_loop(),
+            name="bot-status-rotation-loop",
+        )
 
         if self.config.command_guild_id:
             guild = discord.Object(id=self.config.command_guild_id)
@@ -361,6 +371,12 @@ class ReaderBot(commands.Bot):
             self._cache_refresh_task.cancel()
             try:
                 await self._cache_refresh_task
+            except asyncio.CancelledError:
+                pass
+        if self._status_rotation_task is not None:
+            self._status_rotation_task.cancel()
+            try:
+                await self._status_rotation_task
             except asyncio.CancelledError:
                 pass
 
@@ -533,6 +549,60 @@ class ReaderBot(commands.Bot):
                 raise
             except Exception:
                 LOGGER.exception("Unexpected error in docs cache refresh loop.")
+
+    async def _status_rotation_loop(self) -> None:
+        await self.wait_until_ready()
+        # Avoid changing presence immediately after the gateway becomes ready.
+        await asyncio.sleep(
+            min(
+                INITIAL_STATUS_UPDATE_DELAY_SECONDS,
+                self.config.status_rotation_interval_seconds,
+            )
+        )
+
+        while True:
+            try:
+                await self._rotate_status()
+                await asyncio.sleep(self.config.status_rotation_interval_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Unexpected error in bot status rotation loop.")
+                await asyncio.sleep(self.config.status_rotation_interval_seconds)
+
+    async def _rotate_status(self) -> None:
+        next_status = choose_next_status(
+            DEFAULT_ROTATING_STATUSES,
+            rng=self._status_random,
+            current=self._current_status,
+        )
+        activity = self._build_status_activity(next_status)
+        await self.change_presence(
+            activity=activity,
+            status=discord.Status.online,
+        )
+        self._current_status = next_status
+        LOGGER.info("Updated bot status: %s %s", next_status.kind, next_status.text)
+
+    def _build_status_activity(
+        self,
+        status: BotStatusSpec,
+    ) -> discord.Activity | discord.Game | discord.CustomActivity:
+        if status.kind == "watching":
+            return discord.Activity(
+                name=status.text,
+                type=discord.ActivityType.watching,
+            )
+        if status.kind == "playing":
+            return discord.Game(name=status.text)
+        if status.kind == "listening":
+            return discord.Activity(
+                name=status.text,
+                type=discord.ActivityType.listening,
+            )
+        if status.kind == "custom":
+            return discord.CustomActivity(name=status.text)
+        raise ValueError(f"Unsupported bot status kind: {status.kind}")
 
     async def _message_targets_bot(self, message: discord.Message) -> bool:
         return self._is_direct_bot_mention(message) or await self._is_reply_to_bot(message)

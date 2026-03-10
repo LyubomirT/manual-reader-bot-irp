@@ -26,6 +26,13 @@ def _read_int(name: str, default: int) -> int:
     return value
 
 
+def _read_positive_int(name: str, default: int) -> int:
+    value = _read_int(name, default)
+    if value <= 0:
+        raise ValueError(f"Environment variable {name} must be greater than 0.")
+    return value
+
+
 @dataclass(slots=True)
 class BotConfig:
     discord_bot_token: str
@@ -48,6 +55,7 @@ class BotConfig:
     conversation_max_messages: int
     conversation_inactivity_seconds: int
     cache_refresh_interval_seconds: int
+    status_rotation_interval_seconds: int
     docs_fetch_concurrency: int
     docs_selector_page_limit: int
     http_timeout_seconds: int
@@ -109,6 +117,10 @@ class BotConfig:
             conversation_max_messages=_read_int("CONVERSATION_MAX_MESSAGES", 10),
             conversation_inactivity_seconds=_read_int("CONVERSATION_INACTIVITY_SECONDS", 3600),
             cache_refresh_interval_seconds=_read_int("CACHE_REFRESH_INTERVAL_SECONDS", 21600),
+            status_rotation_interval_seconds=_read_positive_int(
+                "STATUS_ROTATION_INTERVAL_SECONDS",
+                3600,
+            ),
             docs_fetch_concurrency=_read_int("DOCS_FETCH_CONCURRENCY", 5),
             docs_selector_page_limit=_read_int("DOCS_SELECTOR_PAGE_LIMIT", 4),
             http_timeout_seconds=_read_int("HTTP_TIMEOUT_SECONDS", 30),

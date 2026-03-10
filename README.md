@@ -13,6 +13,7 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 - Full normalized docs pages cached locally in SQLite
 - Per-channel/thread and global rate limiting
 - Per-channel/thread conversation memory with 1 hour inactivity expiry
+- Random rotating bot statuses with a configurable update interval
 - Persistent user bans, including AI-triggered auto-blocks on obvious abuse/spam
 - Role and guild gating so the bot only works where it should
 
@@ -56,6 +57,7 @@ The main options live in `.env.example`. The important ones are:
 - `ALLOWED_GUILD_ID`
 - `ALLOWED_ROLE_ID`
 - `BOT_OWNER_USER_ID`
+- `STATUS_ROTATION_INTERVAL_SECONDS`
 - rate limit settings
 - conversation memory settings
 - docs cache / selector settings
