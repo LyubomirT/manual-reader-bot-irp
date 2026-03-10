@@ -61,7 +61,7 @@ class ReaderBot(commands.Bot):
             LOGGER.warning("Docs cache initialization issue: %s", refresh_result.error)
         else:
             LOGGER.info(
-                "Docs cache ready with %s entries (version=%s)",
+                "Docs cache ready with %s pages (version=%s)",
                 refresh_result.entry_count,
                 refresh_result.version or "unknown",
             )
@@ -161,13 +161,11 @@ class ReaderBot(commands.Bot):
             limit=self.config.conversation_max_messages,
             inactivity_seconds=self.config.conversation_inactivity_seconds,
         )
-        docs = self.docs_cache.search(content, limit=self.config.rag_search_limit)
-
         request = ChatRequest(
             question=content,
             user_display_name=message.author.display_name,
             history=history,
-            docs=docs,
+            docs=self.docs_cache.get_pages(),
             docs_available=self.docs_cache.available,
         )
 
@@ -235,7 +233,7 @@ class ReaderBot(commands.Bot):
                     LOGGER.warning("Scheduled docs cache refresh failed: %s", result.error)
                 elif result.updated:
                     LOGGER.info(
-                        "Docs cache refreshed successfully (%s entries, version=%s)",
+                        "Docs cache refreshed successfully (%s pages, version=%s)",
                         result.entry_count,
                         result.version or "unknown",
                     )
@@ -420,7 +418,7 @@ class ReaderBot(commands.Bot):
             title="Cache Updated Successfully",
             description=(
                 f"Version: {result.version or 'unknown'}\n"
-                f"Entries: {result.entry_count}"
+                f"Pages: {result.entry_count}"
             ),
             color=discord.Color.green(),
         )

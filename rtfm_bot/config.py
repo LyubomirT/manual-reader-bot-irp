@@ -33,6 +33,7 @@ class BotConfig:
     discord_bot_token: str
     pollinations_api_key: str
     pollinations_model: str
+    pollinations_selector_model: str
     pollinations_base_url: str
     command_guild_id: int | None
     allowed_guild_id: int
@@ -50,9 +51,7 @@ class BotConfig:
     conversation_inactivity_seconds: int
     cache_refresh_interval_seconds: int
     docs_fetch_concurrency: int
-    rag_chunk_size_chars: int
-    rag_chunk_overlap_chars: int
-    rag_search_limit: int
+    docs_selector_page_limit: int
     http_timeout_seconds: int
     log_level: str
     data_dir: Path
@@ -75,6 +74,9 @@ class BotConfig:
             discord_bot_token=_read_required_env("DISCORD_BOT_TOKEN"),
             pollinations_api_key=_read_required_env("POLLINATIONS_API_KEY"),
             pollinations_model=os.getenv("POLLINATIONS_MODEL", "kimi").strip() or "kimi",
+            pollinations_selector_model=(
+                os.getenv("POLLINATIONS_SELECTOR_MODEL", "openai").strip() or "openai"
+            ),
             pollinations_base_url=(
                 os.getenv("POLLINATIONS_BASE_URL", "https://gen.pollinations.ai/v1").rstrip("/")
             ),
@@ -108,9 +110,7 @@ class BotConfig:
             conversation_inactivity_seconds=_read_int("CONVERSATION_INACTIVITY_SECONDS", 3600),
             cache_refresh_interval_seconds=_read_int("CACHE_REFRESH_INTERVAL_SECONDS", 21600),
             docs_fetch_concurrency=_read_int("DOCS_FETCH_CONCURRENCY", 5),
-            rag_chunk_size_chars=_read_int("RAG_CHUNK_SIZE_CHARS", 1400),
-            rag_chunk_overlap_chars=_read_int("RAG_CHUNK_OVERLAP_CHARS", 250),
-            rag_search_limit=_read_int("RAG_SEARCH_LIMIT", 6),
+            docs_selector_page_limit=_read_int("DOCS_SELECTOR_PAGE_LIMIT", 4),
             http_timeout_seconds=_read_int("HTTP_TIMEOUT_SECONDS", 30),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             data_dir=data_dir,
