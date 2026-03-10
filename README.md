@@ -5,7 +5,8 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 ## Features
 
 - Mention/reply driven chat in public channels
-- Slash commands for `/update_cache` and `/clear_memory`
+- Slash commands for `/help`, `/rate_limit_status`, `/update_cache`, and `/clear_memory`
+- Admin memory inspection via `/inspect_channel_memory` and `/inspect_memory_global`
 - Disk-backed docs cache refreshed on startup and every 6 hours
 - Two-stage docs retrieval: `openai` selects relevant cached pages, then `kimi` answers with full page context
 - Full normalized docs pages cached locally in SQLite
@@ -39,6 +40,8 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
+For a fresh server deployment, see [docs/ubuntu-24.04-vps-setup.md](docs/ubuntu-24.04-vps-setup.md).
+
 ## Environment Variables
 
 The main options live in `.env.example`. The important ones are:
@@ -54,6 +57,15 @@ The main options live in `.env.example`. The important ones are:
 - rate limit settings
 - conversation memory settings
 - docs cache / selector settings
+
+## Commands
+
+- `/help` shows the usage summary and command list.
+- `/rate_limit_status` shows the current channel and global cooldown buckets.
+- `/clear_memory` clears the saved conversation for the current channel/thread.
+- `/inspect_channel_memory` is an admin-only snapshot of the current channel/thread memory.
+- `/inspect_memory_global` is an admin-only browser for all active memory scopes.
+- `/update_cache` force-refreshes the docs cache and is owner-only.
 
 ## Behavior Notes
 
@@ -72,3 +84,8 @@ Runtime data is stored under `data/` by default:
 - `data/reader.sqlite3`
 
 Both are ignored by git.
+
+## Extra Docs
+
+- Deployment guide: [docs/ubuntu-24.04-vps-setup.md](docs/ubuntu-24.04-vps-setup.md)
+- Feature ideas: [docs/feature-ideas.md](docs/feature-ideas.md)

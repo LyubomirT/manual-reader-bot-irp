@@ -16,6 +16,15 @@ class ConversationMessage:
     created_at: datetime
 
 
+@dataclass(slots=True)
+class ConversationScopeSummary:
+    scope_id: int
+    guild_id: int
+    message_count: int
+    last_activity_at: datetime
+    last_message_preview: str | None
+
+
 class ConversationStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -65,6 +74,19 @@ class ConversationStore:
                 author_id,
                 author_name,
                 max_messages,
+                inactivity_seconds,
+            )
+
+    async def get_scope_summaries(
+        self,
+        *,
+        guild_id: int,
+        inactivity_seconds: int,
+    ) -> list[ConversationScopeSummary]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_scope_summaries_sync,
+                guild_id,
                 inactivity_seconds,
             )
 
@@ -210,6 +232,56 @@ class ConversationStore:
             )
             connection.commit()
 
+    def _get_scope_summaries_sync(
+        self,
+        guild_id: int,
+        inactivity_seconds: int,
+    ) -> list[ConversationScopeSummary]:
+        now = datetime.now(UTC)
+
+        with self._connect() as connection:
+            self._purge_inactive_scopes_sync(
+                connection,
+                guild_id=guild_id,
+                inactivity_seconds=inactivity_seconds,
+                now=now,
+            )
+
+            rows = connection.execute(
+                """
+                SELECT
+                    scopes.scope_id,
+                    scopes.guild_id,
+                    scopes.last_activity_at,
+                    COUNT(messages.id) AS message_count,
+                    (
+                        SELECT content
+                        FROM conversation_messages
+                        WHERE scope_id = scopes.scope_id
+                        ORDER BY id DESC
+                        LIMIT 1
+                    ) AS last_message_preview
+                FROM conversation_scopes AS scopes
+                LEFT JOIN conversation_messages AS messages
+                    ON messages.scope_id = scopes.scope_id
+                WHERE scopes.guild_id = ?
+                GROUP BY scopes.scope_id, scopes.guild_id, scopes.last_activity_at
+                ORDER BY scopes.last_activity_at DESC, scopes.scope_id ASC
+                """,
+                (guild_id,),
+            ).fetchall()
+
+        return [
+            ConversationScopeSummary(
+                scope_id=row["scope_id"],
+                guild_id=row["guild_id"],
+                message_count=row["message_count"],
+                last_activity_at=datetime.fromisoformat(row["last_activity_at"]),
+                last_message_preview=row["last_message_preview"],
+            )
+            for row in rows
+        ]
+
     def _clear_scope_sync(self, scope_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -256,8 +328,44 @@ class ConversationStore:
         )
         connection.commit()
 
+    def _purge_inactive_scopes_sync(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        guild_id: int,
+        inactivity_seconds: int,
+        now: datetime,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT scope_id, last_activity_at
+            FROM conversation_scopes
+            WHERE guild_id = ?
+            """,
+            (guild_id,),
+        ).fetchall()
+
+        expired_scope_ids = [
+            row["scope_id"]
+            for row in rows
+            if now - datetime.fromisoformat(row["last_activity_at"])
+            > timedelta(seconds=inactivity_seconds)
+        ]
+        if not expired_scope_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in expired_scope_ids)
+        connection.execute(
+            f"DELETE FROM conversation_messages WHERE scope_id IN ({placeholders})",
+            expired_scope_ids,
+        )
+        connection.execute(
+            f"DELETE FROM conversation_scopes WHERE scope_id IN ({placeholders})",
+            expired_scope_ids,
+        )
+        connection.commit()
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         return connection
-

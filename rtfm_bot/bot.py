@@ -7,15 +7,276 @@ from typing import Any
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from rtfm_bot.config import BotConfig
 from rtfm_bot.docs_cache import DocsCacheManager, RefreshResult
 from rtfm_bot.llm import ChatRequest, PollinationsClient, PollinationsError
-from rtfm_bot.rate_limits import SlidingWindowRateLimiter
-from rtfm_bot.storage import ConversationStore
+from rtfm_bot.rate_limits import RateLimitStatus, SlidingWindowRateLimiter
+from rtfm_bot.storage import (
+    ConversationMessage,
+    ConversationScopeSummary,
+    ConversationStore,
+)
 
 LOGGER = logging.getLogger(__name__)
+MAX_MEMORY_SCOPE_OPTIONS = 25
+MEMORY_VIEW_TIMEOUT_SECONDS = 300
+
+
+def _truncate_text(value: str | None, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", value or "").strip()
+    if not compact:
+        return "No recent text."
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+class MemoryScopeSelect(discord.ui.Select):
+    def __init__(self, parent: "MemoryInspectorView") -> None:
+        super().__init__(
+            placeholder="Pick a channel or thread",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Loading memory scopes...",
+                    value="loading",
+                )
+            ],
+        )
+        self._memory_view = parent
+
+    async def callback(self, interaction: discord.Interaction[Any]) -> None:
+        await self._memory_view.handle_scope_select(interaction, int(self.values[0]))
+
+
+class MemoryInspectorView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        bot: "ReaderBot",
+        actor_id: int,
+        guild: discord.Guild,
+        scope_summaries: list[ConversationScopeSummary],
+        initial_scope_id: int | None = None,
+    ) -> None:
+        super().__init__(timeout=MEMORY_VIEW_TIMEOUT_SECONDS)
+        self.bot = bot
+        self.actor_id = actor_id
+        self.guild = guild
+        self.scope_summaries = scope_summaries
+        self.scope_id = initial_scope_id or (scope_summaries[0].scope_id if scope_summaries else None)
+        self.page_index = 0
+        self.message: discord.InteractionMessage | None = None
+
+        self.scope_select = MemoryScopeSelect(self)
+        self.add_item(self.scope_select)
+
+        self._reposition_page()
+        self._refresh_controls()
+
+    @property
+    def total_pages(self) -> int:
+        if not self.scope_summaries:
+            return 1
+        return max(1, (len(self.scope_summaries) + MAX_MEMORY_SCOPE_OPTIONS - 1) // MAX_MEMORY_SCOPE_OPTIONS)
+
+    @property
+    def selected_summary(self) -> ConversationScopeSummary | None:
+        if self.scope_id is None:
+            return None
+        return next(
+            (summary for summary in self.scope_summaries if summary.scope_id == self.scope_id),
+            None,
+        )
+
+    @property
+    def scope_position(self) -> int | None:
+        if self.scope_id is None:
+            return None
+        for index, summary in enumerate(self.scope_summaries, start=1):
+            if summary.scope_id == self.scope_id:
+                return index
+        return None
+
+    async def handle_scope_select(
+        self,
+        interaction: discord.Interaction[Any],
+        scope_id: int,
+    ) -> None:
+        if not await self._ensure_actor(interaction):
+            return
+
+        self.scope_id = scope_id
+        self._reposition_page()
+        self._refresh_controls()
+        embed = await self._build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is None:
+            return
+
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            return
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def previous_page(
+        self,
+        interaction: discord.Interaction[Any],
+        button: discord.ui.Button,
+    ) -> None:
+        del button
+        if not await self._ensure_actor(interaction):
+            return
+
+        self.page_index = max(0, self.page_index - 1)
+        self._ensure_selected_scope_on_page()
+        self._refresh_controls()
+        embed = await self._build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
+    async def refresh_panel(
+        self,
+        interaction: discord.Interaction[Any],
+        button: discord.ui.Button,
+    ) -> None:
+        del button
+        if not await self._ensure_actor(interaction):
+            return
+
+        self.scope_summaries = await self.bot.store.get_scope_summaries(
+            guild_id=self.guild.id,
+            inactivity_seconds=self.bot.config.conversation_inactivity_seconds,
+        )
+        if self.scope_summaries and self.scope_id not in {
+            summary.scope_id for summary in self.scope_summaries
+        }:
+            self.scope_id = self.scope_summaries[0].scope_id
+        if not self.scope_summaries:
+            self.scope_id = None
+
+        self._reposition_page()
+        self._refresh_controls()
+        embed = await self._build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_page(
+        self,
+        interaction: discord.Interaction[Any],
+        button: discord.ui.Button,
+    ) -> None:
+        del button
+        if not await self._ensure_actor(interaction):
+            return
+
+        self.page_index = min(self.total_pages - 1, self.page_index + 1)
+        self._ensure_selected_scope_on_page()
+        self._refresh_controls()
+        embed = await self._build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _ensure_actor(self, interaction: discord.Interaction[Any]) -> bool:
+        if interaction.user.id == self.actor_id:
+            return True
+
+        await interaction.response.send_message(
+            "This memory panel belongs to someone else.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _build_embed(self) -> discord.Embed:
+        if self.scope_id is None:
+            return self.bot._build_empty_memory_embed()
+
+        return await self.bot._build_memory_embed(
+            guild=self.guild,
+            scope_id=self.scope_id,
+            summary=self.selected_summary,
+            scope_position=self.scope_position,
+            total_scopes=len(self.scope_summaries),
+            page_index=self.page_index + 1,
+            total_pages=self.total_pages,
+        )
+
+    def _current_page_summaries(self) -> list[ConversationScopeSummary]:
+        start = self.page_index * MAX_MEMORY_SCOPE_OPTIONS
+        end = start + MAX_MEMORY_SCOPE_OPTIONS
+        return self.scope_summaries[start:end]
+
+    def _ensure_selected_scope_on_page(self) -> None:
+        page_summaries = self._current_page_summaries()
+        if not page_summaries:
+            self.scope_id = None
+            return
+
+        page_scope_ids = {summary.scope_id for summary in page_summaries}
+        if self.scope_id not in page_scope_ids:
+            self.scope_id = page_summaries[0].scope_id
+
+    def _reposition_page(self) -> None:
+        if not self.scope_summaries:
+            self.page_index = 0
+            self.scope_id = None
+            return
+
+        if self.scope_id is None:
+            self.scope_id = self.scope_summaries[0].scope_id
+
+        selected_index = next(
+            (
+                index
+                for index, summary in enumerate(self.scope_summaries)
+                if summary.scope_id == self.scope_id
+            ),
+            0,
+        )
+        self.page_index = selected_index // MAX_MEMORY_SCOPE_OPTIONS
+        self.scope_id = self.scope_summaries[selected_index].scope_id
+
+    def _refresh_controls(self) -> None:
+        page_summaries = self._current_page_summaries()
+        if not page_summaries:
+            self.scope_select.options = [
+                discord.SelectOption(
+                    label="No active memory",
+                    value="0",
+                    description="Nothing is cached right now.",
+                )
+            ]
+            self.scope_select.disabled = True
+        else:
+            options: list[discord.SelectOption] = []
+            for summary in page_summaries:
+                scope_name = self.bot._format_scope_label(self.guild, summary.scope_id)
+                description = (
+                    f"{summary.message_count} msgs | "
+                    f"{_truncate_text(summary.last_message_preview, 72)}"
+                )
+                options.append(
+                    discord.SelectOption(
+                        label=_truncate_text(scope_name, 100),
+                        value=str(summary.scope_id),
+                        description=_truncate_text(description, 100),
+                        default=summary.scope_id == self.scope_id,
+                    )
+                )
+            self.scope_select.options = options
+            self.scope_select.disabled = False
+
+        self.previous_page.disabled = self.page_index <= 0 or self.total_pages <= 1
+        self.next_page.disabled = self.page_index >= self.total_pages - 1 or self.total_pages <= 1
 
 
 class ReaderBot(commands.Bot):
@@ -280,6 +541,17 @@ class ReaderBot(commands.Bot):
             return False
         return any(role.id == self.config.allowed_role_id for role in interaction.user.roles)
 
+    def _interaction_is_admin(self, interaction: discord.Interaction[Any]) -> bool:
+        if interaction.guild_id != self.config.allowed_guild_id:
+            return False
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        if interaction.user.id == self.config.owner_user_id:
+            return True
+
+        permissions = interaction.user.guild_permissions
+        return permissions.administrator or permissions.manage_guild
+
     def _strip_bot_mentions(self, content: str) -> str:
         if self.user is None:
             return content.strip()
@@ -326,6 +598,192 @@ class ReaderBot(commands.Bot):
 
         return chunks
 
+    def _resolve_scope(
+        self,
+        guild: discord.Guild,
+        scope_id: int,
+    ) -> discord.abc.GuildChannel | discord.Thread | None:
+        channel = guild.get_channel(scope_id)
+        if channel is not None:
+            return channel
+
+        thread = guild.get_thread(scope_id)
+        if thread is not None:
+            return thread
+
+        get_channel_or_thread = getattr(guild, "get_channel_or_thread", None)
+        if callable(get_channel_or_thread):
+            resolved = get_channel_or_thread(scope_id)
+            if resolved is not None:
+                return resolved
+
+        return None
+
+    def _format_scope_label(self, guild: discord.Guild, scope_id: int) -> str:
+        scope = self._resolve_scope(guild, scope_id)
+        if scope is None:
+            return f"Unknown scope ({scope_id})"
+        if isinstance(scope, discord.Thread):
+            return f"{scope.parent.name if scope.parent else 'thread'} / {scope.name}"
+        return f"#{scope.name}"
+
+    def _format_memory_author(self, message: ConversationMessage) -> str:
+        if message.author_name:
+            return message.author_name
+        if message.role == "assistant":
+            return "Reader of the Manual"
+        return "Unknown user"
+
+    def _format_memory_transcript(self, messages: list[ConversationMessage]) -> str:
+        if not messages:
+            return "No saved messages in this scope right now."
+
+        lines = []
+        for message in messages:
+            timestamp = discord.utils.format_dt(message.created_at, style="t")
+            speaker = self._format_memory_author(message)
+            content = _truncate_text(message.content, 180)
+            lines.append(f"{timestamp} {speaker}: {content}")
+
+        transcript = "\n".join(lines)
+        if len(transcript) <= 4000:
+            return transcript
+        return transcript[:3997].rstrip() + "..."
+
+    async def _build_memory_embed(
+        self,
+        *,
+        guild: discord.Guild,
+        scope_id: int,
+        summary: ConversationScopeSummary | None,
+        scope_position: int | None = None,
+        total_scopes: int | None = None,
+        page_index: int | None = None,
+        total_pages: int | None = None,
+    ) -> discord.Embed:
+        messages = await self.store.get_recent_messages(
+            scope_id=scope_id,
+            guild_id=guild.id,
+            limit=self.config.conversation_max_messages,
+            inactivity_seconds=self.config.conversation_inactivity_seconds,
+        )
+
+        scope = self._resolve_scope(guild, scope_id)
+        scope_title = self._format_scope_label(guild, scope_id)
+        scope_ref = scope.mention if scope is not None and hasattr(scope, "mention") else f"`{scope_id}`"
+        embed = discord.Embed(
+            title=f"Memory Inspector: {scope_title}",
+            description=self._format_memory_transcript(messages),
+            color=discord.Color.blurple(),
+        )
+
+        summary_lines = [f"Scope: {scope_ref}"]
+        summary_lines.append(
+            f"Stored messages: {summary.message_count if summary is not None else len(messages)}"
+        )
+        if summary is not None:
+            summary_lines.append(
+                f"Last activity: {discord.utils.format_dt(summary.last_activity_at, style='R')}"
+            )
+        summary_lines.append(f"Message cap: {self.config.conversation_max_messages}")
+        summary_lines.append(
+            f"Inactivity expiry: {self.config.conversation_inactivity_seconds}s"
+        )
+        if scope_position is not None and total_scopes is not None:
+            summary_lines.append(f"Scope position: {scope_position}/{total_scopes}")
+
+        embed.add_field(name="Summary", value="\n".join(summary_lines), inline=False)
+
+        footer_parts = ["Reader of the Manual"]
+        if page_index is not None and total_pages is not None:
+            footer_parts.append(f"Page {page_index}/{total_pages}")
+        embed.set_footer(text=" | ".join(footer_parts))
+        return embed
+
+    def _build_empty_memory_embed(self) -> discord.Embed:
+        return self._build_embed(
+            title="Memory Inspector",
+            description="No active channel or thread memory is cached right now.",
+            color=discord.Color.orange(),
+        )
+
+    def _format_rate_limit_status(self, status: RateLimitStatus) -> str:
+        if status.used == 0:
+            recent_activity = "No recent hits."
+        else:
+            recent_activity = f"Oldest hit resets in about {status.resets_in}s."
+
+        state = "Cooling down" if status.retry_after else "Ready"
+        lines = [
+            f"State: {state}",
+            f"Used: {status.used}/{status.limit}",
+            f"Remaining: {status.remaining}",
+            f"Window: {status.window_seconds}s",
+            recent_activity,
+        ]
+        if status.retry_after:
+            lines.append(f"Retry after: {status.retry_after}s")
+        return "\n".join(lines)
+
+    def _build_rate_limit_status_embed(self, channel_id: int) -> discord.Embed:
+        channel_status = self.channel_rate_limiter.status(channel_id)
+        global_status = self.global_rate_limiter.status("global")
+        embed = self._build_embed(
+            title="Rate Limit Status",
+            description="Current cooldown buckets for this channel and the whole bot.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="This Channel",
+            value=self._format_rate_limit_status(channel_status),
+            inline=False,
+        )
+        embed.add_field(
+            name="Global",
+            value=self._format_rate_limit_status(global_status),
+            inline=False,
+        )
+        return embed
+
+    def _build_help_embed(self) -> discord.Embed:
+        mention = self.user.mention if self.user is not None else "@Reader of the Manual"
+        embed = self._build_embed(
+            title="How To Use Reader of the Manual",
+            description=(
+                f"Mention {mention} or reply to one of my answers with a docs question and "
+                "I'll dig through the IntenseRP Next manual for you."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Public Commands",
+            value="/help\n/rate_limit_status",
+            inline=False,
+        )
+        embed.add_field(
+            name="Helper Role",
+            value=(
+                "Mention or reply to me to ask docs questions.\n"
+                "/clear_memory to wipe the saved conversation for the current channel or thread."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Admin Stuff",
+            value=(
+                "/inspect_channel_memory\n"
+                "/inspect_memory_global\n"
+                "/update_cache (owner only)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Example",
+            value=f"{mention} how do I install the app?",
+            inline=False,
+        )
+        return embed
+
     def _register_commands(self) -> None:
         @self.tree.command(name="update_cache", description="Force-refresh the docs cache.")
         async def update_cache(interaction: discord.Interaction[Any]) -> None:
@@ -366,6 +824,167 @@ class ReaderBot(commands.Bot):
             result = await self.docs_cache.maybe_refresh(self.http_session, force=True)
             embed = self._cache_result_to_embed(result)
             await interaction.followup.send(embed=embed)
+
+        @self.tree.command(
+            name="inspect_channel_memory",
+            description="Inspect the saved memory for this channel or thread.",
+        )
+        @app_commands.default_permissions(administrator=True)
+        async def inspect_channel_memory(interaction: discord.Interaction[Any]) -> None:
+            if not self._interaction_is_admin(interaction):
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Nope",
+                        description="You need admin-level server permissions for this one.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if interaction.guild is None or interaction.channel_id is None:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Can't Inspect Memory",
+                        description="I couldn't figure out which channel/thread to inspect.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            summaries = await self.store.get_scope_summaries(
+                guild_id=interaction.guild.id,
+                inactivity_seconds=self.config.conversation_inactivity_seconds,
+            )
+            summary = next(
+                (
+                    candidate
+                    for candidate in summaries
+                    if candidate.scope_id == interaction.channel_id
+                ),
+                None,
+            )
+            embed = await self._build_memory_embed(
+                guild=interaction.guild,
+                scope_id=interaction.channel_id,
+                summary=summary,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        @self.tree.command(
+            name="inspect_memory_global",
+            description="Browse saved memory across channels and threads.",
+        )
+        @app_commands.default_permissions(administrator=True)
+        async def inspect_memory_global(interaction: discord.Interaction[Any]) -> None:
+            if not self._interaction_is_admin(interaction):
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Nope",
+                        description="You need admin-level server permissions for this one.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if interaction.guild is None:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Wrong Server",
+                        description="This command only works inside the configured server.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            summaries = await self.store.get_scope_summaries(
+                guild_id=interaction.guild.id,
+                inactivity_seconds=self.config.conversation_inactivity_seconds,
+            )
+            if not summaries:
+                await interaction.response.send_message(
+                    embed=self._build_empty_memory_embed(),
+                    ephemeral=True,
+                )
+                return
+
+            view = MemoryInspectorView(
+                bot=self,
+                actor_id=interaction.user.id,
+                guild=interaction.guild,
+                scope_summaries=summaries,
+            )
+            embed = await self._build_memory_embed(
+                guild=interaction.guild,
+                scope_id=view.scope_id,
+                summary=view.selected_summary,
+                scope_position=view.scope_position,
+                total_scopes=len(summaries),
+                page_index=view.page_index + 1,
+                total_pages=view.total_pages,
+            )
+            await interaction.response.send_message(
+                embed=embed,
+                view=view,
+                ephemeral=True,
+            )
+            try:
+                view.message = await interaction.original_response()
+            except discord.HTTPException:
+                view.message = None
+
+        @self.tree.command(name="help", description="Show how to use the bot.")
+        async def help_command(interaction: discord.Interaction[Any]) -> None:
+            if interaction.guild_id != self.config.allowed_guild_id:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Wrong Server",
+                        description="This bot only works inside the configured server.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_message(
+                embed=self._build_help_embed(),
+                ephemeral=True,
+            )
+
+        @self.tree.command(
+            name="rate_limit_status",
+            description="Show the current channel and global cooldown status.",
+        )
+        async def rate_limit_status(interaction: discord.Interaction[Any]) -> None:
+            if interaction.guild_id != self.config.allowed_guild_id:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Wrong Server",
+                        description="This bot only works inside the configured server.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if interaction.channel_id is None:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Can't Check Rate Limits",
+                        description="I couldn't determine the current channel.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_message(
+                embed=self._build_rate_limit_status_embed(interaction.channel_id),
+                ephemeral=True,
+            )
 
         @self.tree.command(
             name="clear_memory",

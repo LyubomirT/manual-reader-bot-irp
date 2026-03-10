@@ -3,6 +3,18 @@ from __future__ import annotations
 import math
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class RateLimitStatus:
+    key: str | int
+    used: int
+    limit: int
+    window_seconds: int
+    remaining: int
+    retry_after: int
+    resets_in: int
 
 
 class SlidingWindowRateLimiter:
@@ -14,16 +26,32 @@ class SlidingWindowRateLimiter:
         self._events: dict[str | int, deque[float]] = defaultdict(deque)
 
     def retry_after(self, key: str | int) -> int:
+        return self.status(key).retry_after
+
+    def status(self, key: str | int) -> RateLimitStatus:
         now = time.monotonic()
         bucket = self._events[key]
         self._trim(bucket, now)
 
-        if len(bucket) < self.limit:
-            return 0
+        used = len(bucket)
+        retry_after = 0
+        resets_in = 0
 
-        oldest = bucket[0]
-        remaining = self.window_seconds - (now - oldest)
-        return max(1, math.ceil(remaining))
+        if bucket:
+            oldest = bucket[0]
+            resets_in = max(1, math.ceil(self.window_seconds - (now - oldest)))
+            if used >= self.limit:
+                retry_after = resets_in
+
+        return RateLimitStatus(
+            key=key,
+            used=used,
+            limit=self.limit,
+            window_seconds=self.window_seconds,
+            remaining=max(0, self.limit - used),
+            retry_after=retry_after,
+            resets_in=resets_in,
+        )
 
     def hit(self, key: str | int) -> None:
         now = time.monotonic()
@@ -35,4 +63,3 @@ class SlidingWindowRateLimiter:
         cutoff = now - self.window_seconds
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
-
