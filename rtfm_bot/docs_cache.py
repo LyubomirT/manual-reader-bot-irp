@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
-import aiohttp
-
 from rtfm_bot.config import BotConfig
+
+if TYPE_CHECKING:
+    import aiohttp
 
 LOGGER = logging.getLogger(__name__)
 

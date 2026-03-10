@@ -7,11 +7,13 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 - Mention/reply driven chat in public channels
 - Slash commands for `/help`, `/rate_limit_status`, `/update_cache`, and `/clear_memory`
 - Admin memory inspection via `/inspect_channel_memory` and `/inspect_memory_global`
+- Admin user blocking via `/ban_user` and `/unban_user`
 - Disk-backed docs cache refreshed on startup and every 6 hours
 - Two-stage docs retrieval: `openai` selects relevant cached pages, then `kimi` answers with full page context
 - Full normalized docs pages cached locally in SQLite
 - Per-channel/thread and global rate limiting
 - Per-channel/thread conversation memory with 1 hour inactivity expiry
+- Persistent user bans, including AI-triggered auto-blocks on obvious abuse/spam
 - Role and guild gating so the bot only works where it should
 
 ## Requirements
@@ -65,16 +67,20 @@ The main options live in `.env.example`. The important ones are:
 - `/clear_memory` clears the saved conversation for the current channel/thread.
 - `/inspect_channel_memory` is an admin-only snapshot of the current channel/thread memory.
 - `/inspect_memory_global` is an admin-only browser for all active memory scopes.
+- `/ban_user` manually blocks a user from using the bot.
+- `/unban_user` manually removes a block. AI-triggered blocks can only be undone by the bot owner.
 - `/update_cache` force-refreshes the docs cache and is owner-only.
 
 ## Behavior Notes
 
 - The bot only answers in the configured guild.
 - Users must have the configured role to use it.
+- Blocked users cannot chat with the bot or use any slash commands.
 - DMs are rejected.
 - Replies are plain text; system slash command responses use embeds.
 - Docs retrieval now uses a model-assisted page selector over the full cached docs corpus.
 - The LLM is instructed not to reveal reasoning traces.
+- The LLM may auto-block users by returning the internal `[ban_user]` sentinel for obvious abuse, spam, or token-wasting nonsense.
 
 ## Data Files
 

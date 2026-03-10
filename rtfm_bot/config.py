@@ -4,8 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 
 def _read_required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -66,6 +64,8 @@ class BotConfig:
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        from dotenv import load_dotenv
+
         load_dotenv()
 
         data_dir = Path(os.getenv("BOT_DATA_DIR", "data")).resolve()

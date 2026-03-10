@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+BAN_SOURCE_AI = "ai"
+BAN_SOURCE_MANUAL = "manual"
+
 
 @dataclass(slots=True)
 class ConversationMessage:
@@ -23,6 +26,15 @@ class ConversationScopeSummary:
     message_count: int
     last_activity_at: datetime
     last_message_preview: str | None
+
+
+@dataclass(slots=True)
+class UserBan:
+    user_id: int
+    source: str
+    banned_at: datetime
+    banned_by_user_id: int | None
+    banned_by_name: str | None
 
 
 class ConversationStore:
@@ -94,6 +106,35 @@ class ConversationStore:
         async with self._lock:
             await asyncio.to_thread(self._clear_scope_sync, scope_id)
 
+    async def get_user_ban(self, *, user_id: int) -> UserBan | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._get_user_ban_sync, user_id)
+
+    async def is_user_banned(self, *, user_id: int) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._is_user_banned_sync, user_id)
+
+    async def ban_user(
+        self,
+        *,
+        user_id: int,
+        source: str,
+        banned_by_user_id: int | None,
+        banned_by_name: str | None,
+    ) -> UserBan:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._ban_user_sync,
+                user_id,
+                source,
+                banned_by_user_id,
+                banned_by_name,
+            )
+
+    async def unban_user(self, *, user_id: int) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._unban_user_sync, user_id)
+
     def _initialize_sync(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -125,6 +166,23 @@ class ConversationStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_conversation_messages_scope_id
                 ON conversation_messages(scope_id, id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_bans (
+                    user_id INTEGER PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    banned_at TEXT NOT NULL,
+                    banned_by_user_id INTEGER,
+                    banned_by_name TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_bans_banned_at
+                ON user_bans(banned_at DESC)
                 """
             )
             connection.commit()
@@ -293,6 +351,99 @@ class ConversationStore:
                 (scope_id,),
             )
             connection.commit()
+
+    def _get_user_ban_sync(self, user_id: int) -> UserBan | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT user_id, source, banned_at, banned_by_user_id, banned_by_name
+                FROM user_bans
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return UserBan(
+            user_id=row["user_id"],
+            source=row["source"],
+            banned_at=datetime.fromisoformat(row["banned_at"]),
+            banned_by_user_id=row["banned_by_user_id"],
+            banned_by_name=row["banned_by_name"],
+        )
+
+    def _is_user_banned_sync(self, user_id: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM user_bans
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+
+        return row is not None
+
+    def _ban_user_sync(
+        self,
+        user_id: int,
+        source: str,
+        banned_by_user_id: int | None,
+        banned_by_name: str | None,
+    ) -> UserBan:
+        banned_at = datetime.now(UTC)
+        banned_at_iso = banned_at.isoformat()
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_bans (
+                    user_id,
+                    source,
+                    banned_at,
+                    banned_by_user_id,
+                    banned_by_name
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    source = excluded.source,
+                    banned_at = excluded.banned_at,
+                    banned_by_user_id = excluded.banned_by_user_id,
+                    banned_by_name = excluded.banned_by_name
+                """,
+                (
+                    user_id,
+                    source,
+                    banned_at_iso,
+                    banned_by_user_id,
+                    banned_by_name,
+                ),
+            )
+            connection.commit()
+
+        return UserBan(
+            user_id=user_id,
+            source=source,
+            banned_at=banned_at,
+            banned_by_user_id=banned_by_user_id,
+            banned_by_name=banned_by_name,
+        )
+
+    def _unban_user_sync(self, user_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM user_bans
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+            connection.commit()
+
+        return cursor.rowcount > 0
 
     def _purge_scope_if_inactive_sync(
         self,

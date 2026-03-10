@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from rtfm_bot.storage import ConversationStore
+from rtfm_bot.storage import BAN_SOURCE_AI, ConversationStore
 
 
 class ConversationStoreTests(unittest.TestCase):
@@ -86,6 +86,32 @@ class ConversationStoreTests(unittest.TestCase):
         )
 
         self.assertEqual([summary.scope_id for summary in summaries], [101])
+
+    def test_ban_user_persists_until_unbanned(self) -> None:
+        self.assertFalse(self.store._is_user_banned_sync(404))
+
+        ban = self.store._ban_user_sync(
+            user_id=404,
+            source=BAN_SOURCE_AI,
+            banned_by_user_id=99,
+            banned_by_name="Reader of the Manual",
+        )
+
+        self.assertEqual(ban.user_id, 404)
+        self.assertEqual(ban.source, BAN_SOURCE_AI)
+        self.assertTrue(self.store._is_user_banned_sync(404))
+
+        loaded_ban = self.store._get_user_ban_sync(404)
+        self.assertIsNotNone(loaded_ban)
+        assert loaded_ban is not None
+        self.assertEqual(loaded_ban.user_id, 404)
+        self.assertEqual(loaded_ban.source, BAN_SOURCE_AI)
+        self.assertEqual(loaded_ban.banned_by_user_id, 99)
+        self.assertEqual(loaded_ban.banned_by_name, "Reader of the Manual")
+
+        self.assertTrue(self.store._unban_user_sync(404))
+        self.assertFalse(self.store._is_user_banned_sync(404))
+        self.assertIsNone(self.store._get_user_ban_sync(404))
 
 
 if __name__ == "__main__":

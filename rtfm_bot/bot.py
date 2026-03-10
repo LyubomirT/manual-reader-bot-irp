@@ -12,17 +12,31 @@ from discord.ext import commands
 
 from rtfm_bot.config import BotConfig
 from rtfm_bot.docs_cache import DocsCacheManager, RefreshResult
-from rtfm_bot.llm import ChatRequest, PollinationsClient, PollinationsError
+from rtfm_bot.llm import (
+    ChatRequest,
+    PollinationsClient,
+    PollinationsError,
+    is_ban_user_signal,
+)
 from rtfm_bot.rate_limits import RateLimitStatus, SlidingWindowRateLimiter
 from rtfm_bot.storage import (
+    BAN_SOURCE_AI,
+    BAN_SOURCE_MANUAL,
     ConversationMessage,
     ConversationScopeSummary,
     ConversationStore,
+    UserBan,
 )
 
 LOGGER = logging.getLogger(__name__)
 MAX_MEMORY_SCOPE_OPTIONS = 25
 MEMORY_VIEW_TIMEOUT_SECONDS = 300
+AI_BAN_BLOCK_MESSAGE = "You're blocked from using Reader of the Manual now."
+AI_BAN_NOTICE_MESSAGE = (
+    "The AI blocked you for suspected abuse, weird messaging, or wasting the owner's tokens. "
+    "Only the bot owner can undo an AI block."
+)
+GENERIC_BANNED_MESSAGE = "You're blocked from using Reader of the Manual."
 
 
 def _truncate_text(value: str | None, limit: int) -> str:
@@ -292,6 +306,7 @@ class ReaderBot(commands.Bot):
         )
 
         self.config = config
+        setattr(self.tree, "interaction_check", self._tree_interaction_check)
         self.store = ConversationStore(config.database_file_path)
         self.docs_cache = DocsCacheManager(config)
         self.http_session: aiohttp.ClientSession | None = None
@@ -364,6 +379,8 @@ class ReaderBot(commands.Bot):
             return
 
         if message.guild is None:
+            if await self._handle_banned_message(message):
+                return
             await message.channel.send("I only work inside the IntenseRP Next server, sorry.")
             return
 
@@ -371,6 +388,9 @@ class ReaderBot(commands.Bot):
             return
 
         if not await self._message_targets_bot(message):
+            return
+
+        if await self._handle_banned_message(message):
             return
 
         if not self._member_has_allowed_role(message.author):
@@ -446,6 +466,17 @@ class ReaderBot(commands.Bot):
                 "Something broke while I was digging through the manual. Please try again in a bit.",
                 mention_author=False,
             )
+            return
+
+        if is_ban_user_signal(response_text):
+            try:
+                await self._apply_ai_ban(message)
+            except Exception:
+                LOGGER.exception("Failed to apply an AI-triggered ban.")
+                await message.reply(
+                    "I tripped over the moderation bit just now. Please poke the bot owner.",
+                    mention_author=False,
+                )
             return
 
         await self._send_reply(message, response_text)
@@ -551,6 +582,81 @@ class ReaderBot(commands.Bot):
 
         permissions = interaction.user.guild_permissions
         return permissions.administrator or permissions.manage_guild
+
+    def _user_is_owner(self, user_id: int) -> bool:
+        return user_id == self.config.owner_user_id
+
+    def _display_name_for_user(self, user: discord.abc.User) -> str:
+        display_name = getattr(user, "display_name", None)
+        if isinstance(display_name, str) and display_name.strip():
+            return display_name.strip()
+
+        global_name = getattr(user, "global_name", None)
+        if isinstance(global_name, str) and global_name.strip():
+            return global_name.strip()
+
+        name = getattr(user, "name", None)
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+
+        return "Unknown user"
+
+    async def _tree_interaction_check(self, interaction: discord.Interaction[Any]) -> bool:
+        ban = await self._get_user_ban(interaction.user.id)
+        if ban is None:
+            return True
+
+        await interaction.response.send_message(
+            embed=self._build_banned_embed(),
+            ephemeral=True,
+        )
+        return False
+
+    async def _get_user_ban(self, user_id: int) -> UserBan | None:
+        if self._user_is_owner(user_id):
+            return None
+        return await self.store.get_user_ban(user_id=user_id)
+
+    async def _handle_banned_message(self, message: discord.Message) -> bool:
+        ban = await self._get_user_ban(message.author.id)
+        if ban is None:
+            return False
+
+        await message.reply(
+            GENERIC_BANNED_MESSAGE,
+            mention_author=False,
+        )
+        return True
+
+    async def _apply_ai_ban(self, message: discord.Message) -> None:
+        if self._user_is_owner(message.author.id):
+            LOGGER.warning(
+                "Ignored AI-triggered ban attempt for owner user %s.",
+                message.author.id,
+            )
+            await message.reply(
+                "I almost swung the ban hammer there, but I won't auto-ban the bot owner.",
+                mention_author=False,
+            )
+            return
+
+        banned_by_user_id = self.user.id if self.user is not None else None
+        banned_by_name = self.user.display_name if self.user is not None else "Reader of the Manual"
+        await self.store.ban_user(
+            user_id=message.author.id,
+            source=BAN_SOURCE_AI,
+            banned_by_user_id=banned_by_user_id,
+            banned_by_name=banned_by_name,
+        )
+
+        block_message = await message.reply(
+            AI_BAN_BLOCK_MESSAGE,
+            mention_author=False,
+        )
+        await block_message.reply(
+            AI_BAN_NOTICE_MESSAGE,
+            mention_author=False,
+        )
 
     def _strip_bot_mentions(self, content: str) -> str:
         if self.user is None:
@@ -707,6 +813,13 @@ class ReaderBot(commands.Bot):
             color=discord.Color.orange(),
         )
 
+    def _build_banned_embed(self) -> discord.Embed:
+        return self._build_embed(
+            title="Blocked",
+            description=GENERIC_BANNED_MESSAGE,
+            color=discord.Color.red(),
+        )
+
     def _format_rate_limit_status(self, status: RateLimitStatus) -> str:
         if status.used == 0:
             recent_activity = "No recent hits."
@@ -773,6 +886,8 @@ class ReaderBot(commands.Bot):
             value=(
                 "/inspect_channel_memory\n"
                 "/inspect_memory_global\n"
+                "/ban_user\n"
+                "/unban_user\n"
                 "/update_cache (owner only)"
             ),
             inline=False,
@@ -935,6 +1050,144 @@ class ReaderBot(commands.Bot):
                 view.message = await interaction.original_response()
             except discord.HTTPException:
                 view.message = None
+
+        @self.tree.command(
+            name="ban_user",
+            description="Block a user from using the bot.",
+        )
+        @app_commands.default_permissions(administrator=True)
+        @app_commands.describe(user="User to block from the bot")
+        async def ban_user(
+            interaction: discord.Interaction[Any],
+            user: discord.User,
+        ) -> None:
+            if not self._interaction_is_admin(interaction):
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Nope",
+                        description="You need admin-level server permissions for this one.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if user.id == interaction.user.id:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Nice Try",
+                        description="I'm not letting you ban yourself with a slash command.",
+                        color=discord.Color.orange(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if self._user_is_owner(user.id):
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Hands Off",
+                        description="The bot owner cannot be banned.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if self.user is not None and user.id == self.user.id:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Absolutely Not",
+                        description="I'm not banning myself. That seems bad for business.",
+                        color=discord.Color.orange(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            existing_ban = await self.store.get_user_ban(user_id=user.id)
+            if existing_ban is not None:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Already Blocked",
+                        description=f"{user.mention} is already blocked from using the bot.",
+                        color=discord.Color.orange(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await self.store.ban_user(
+                user_id=user.id,
+                source=BAN_SOURCE_MANUAL,
+                banned_by_user_id=interaction.user.id,
+                banned_by_name=self._display_name_for_user(interaction.user),
+            )
+            await interaction.response.send_message(
+                embed=self._build_embed(
+                    title="User Blocked",
+                    description=f"{user.mention} can no longer use the bot.",
+                    color=discord.Color.green(),
+                ),
+                ephemeral=True,
+            )
+
+        @self.tree.command(
+            name="unban_user",
+            description="Unblock a user from using the bot.",
+        )
+        @app_commands.default_permissions(administrator=True)
+        @app_commands.describe(user="User to unblock from the bot")
+        async def unban_user(
+            interaction: discord.Interaction[Any],
+            user: discord.User,
+        ) -> None:
+            if not self._interaction_is_admin(interaction):
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Nope",
+                        description="You need admin-level server permissions for this one.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            existing_ban = await self.store.get_user_ban(user_id=user.id)
+            if existing_ban is None:
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Not Blocked",
+                        description=f"{user.mention} is not currently blocked.",
+                        color=discord.Color.orange(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if (
+                existing_ban.source == BAN_SOURCE_AI
+                and interaction.user.id != self.config.owner_user_id
+            ):
+                await interaction.response.send_message(
+                    embed=self._build_embed(
+                        title="Owner Only",
+                        description="Only the bot owner can undo an AI-triggered block.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await self.store.unban_user(user_id=user.id)
+            await interaction.response.send_message(
+                embed=self._build_embed(
+                    title="User Unblocked",
+                    description=f"{user.mention} can use the bot again.",
+                    color=discord.Color.green(),
+                ),
+                ephemeral=True,
+            )
 
         @self.tree.command(name="help", description="Show how to use the bot.")
         async def help_command(interaction: discord.Interaction[Any]) -> None:
