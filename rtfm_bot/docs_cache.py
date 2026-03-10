@@ -261,6 +261,9 @@ class DocsCacheManager:
                 upstream_version = await self._fetch_upstream_version(session)
             except Exception:
                 upstream_version = snapshot.version if snapshot is not None else None
+            else:
+                if upstream_version is None and snapshot is not None:
+                    upstream_version = snapshot.version
 
             is_stale = snapshot is None or (
                 datetime.now(UTC) - snapshot.fetched_at
@@ -317,7 +320,7 @@ class DocsCacheManager:
     async def _fetch_upstream_version(self, session: aiohttp.ClientSession) -> str | None:
         async with session.get(self._config.app_version_url) as response:
             response.raise_for_status()
-            payload = await response.json()
+            payload = await self._read_json_object_response(response)
         return str(payload.get("version") or "").strip() or None
 
     async def _fetch_search_index(self, session: aiohttp.ClientSession) -> dict[str, object]:
@@ -326,7 +329,17 @@ class DocsCacheManager:
 
         async with session.get(self._config.docs_search_index_url) as response:
             response.raise_for_status()
-            return await response.json()
+            return await self._read_json_object_response(response)
+
+    async def _read_json_object_response(
+        self,
+        response: aiohttp.ClientResponse,
+    ) -> dict[str, object]:
+        # Some upstream endpoints, including GitHub raw files, send JSON with text/plain.
+        payload = json.loads(await response.text())
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected JSON payload: expected an object.")
+        return payload
 
     def _read_local_search_index(self, path: Path) -> dict[str, object]:
         return json.loads(path.read_text(encoding="utf-8"))
