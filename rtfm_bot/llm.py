@@ -32,11 +32,11 @@ class PollinationsClient:
             "model": self._config.pollinations_model,
             "stream": False,
             "temperature": 0.7,
-            "max_tokens": 8192,
+            "max_tokens": 4096,
             "response_format": {"type": "text"},
             "reasoning_effort": "none",
             "thinking_budget": 0,
-            "thinking": {"type": "enabled", "budget_tokens": 4000},
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": self._build_messages(request),
         }
 
@@ -66,7 +66,7 @@ class PollinationsClient:
                 "role": "system",
                 "content": (
                     "You are Reader of the Manual, a Discord bot for the IntenseRP Next server. "
-                    "Your main job is helping users with the IntenseRP Next documentation. "
+                    "Your main job is helping users with the IntenseRP Next (by LyubomirT) documentation. "
                     "If the question is about the docs, rely on the provided documentation context first. "
                     "If the docs do not clearly answer the question, say so plainly instead of guessing. "
                     "If the user is just chatting, light small talk is fine, but keep it brief. "

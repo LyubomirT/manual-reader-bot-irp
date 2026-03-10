@@ -40,6 +40,7 @@ class BotConfig:
     owner_user_id: int
     docs_base_url: str
     docs_search_index_url: str
+    docs_search_index_file: Path | None
     app_version_url: str
     channel_rate_limit_count: int
     channel_rate_limit_window_seconds: int
@@ -48,6 +49,10 @@ class BotConfig:
     conversation_max_messages: int
     conversation_inactivity_seconds: int
     cache_refresh_interval_seconds: int
+    docs_fetch_concurrency: int
+    rag_chunk_size_chars: int
+    rag_chunk_overlap_chars: int
+    rag_search_limit: int
     http_timeout_seconds: int
     log_level: str
     data_dir: Path
@@ -86,6 +91,11 @@ class BotConfig:
                 "DOCS_SEARCH_INDEX_URL",
                 "https://intense-rp-next.readthedocs.io/en/latest/search.json",
             ).strip(),
+            docs_search_index_file=(
+                Path(path_value).resolve()
+                if (path_value := os.getenv("DOCS_SEARCH_INDEX_FILE", "").strip())
+                else None
+            ),
             app_version_url=os.getenv(
                 "APP_VERSION_URL",
                 "https://raw.githubusercontent.com/LyubomirT/intense-rp-next/refs/heads/v2-rewrite/version.json",
@@ -97,8 +107,11 @@ class BotConfig:
             conversation_max_messages=_read_int("CONVERSATION_MAX_MESSAGES", 10),
             conversation_inactivity_seconds=_read_int("CONVERSATION_INACTIVITY_SECONDS", 3600),
             cache_refresh_interval_seconds=_read_int("CACHE_REFRESH_INTERVAL_SECONDS", 21600),
+            docs_fetch_concurrency=_read_int("DOCS_FETCH_CONCURRENCY", 5),
+            rag_chunk_size_chars=_read_int("RAG_CHUNK_SIZE_CHARS", 1400),
+            rag_chunk_overlap_chars=_read_int("RAG_CHUNK_OVERLAP_CHARS", 250),
+            rag_search_limit=_read_int("RAG_SEARCH_LIMIT", 6),
             http_timeout_seconds=_read_int("HTTP_TIMEOUT_SECONDS", 30),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             data_dir=data_dir,
         )
-

@@ -7,7 +7,6 @@ from typing import Any
 
 import aiohttp
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 from rtfm_bot.config import BotConfig
@@ -162,7 +161,7 @@ class ReaderBot(commands.Bot):
             limit=self.config.conversation_max_messages,
             inactivity_seconds=self.config.conversation_inactivity_seconds,
         )
-        docs = self.docs_cache.search(content, limit=5)
+        docs = self.docs_cache.search(content, limit=self.config.rag_search_limit)
 
         request = ChatRequest(
             question=content,
@@ -430,4 +429,3 @@ class ReaderBot(commands.Bot):
         embed = discord.Embed(title=title, description=description, color=color)
         embed.set_footer(text="Reader of the Manual")
         return embed
-

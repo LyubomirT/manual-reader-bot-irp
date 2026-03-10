@@ -7,6 +7,7 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 - Mention/reply driven chat in public channels
 - Slash commands for `/update_cache` and `/clear_memory`
 - Disk-backed docs cache refreshed on startup and every 6 hours
+- Chunked local RAG over cached docs pages with SQLite FTS5 search
 - Per-channel/thread and global rate limiting
 - Per-channel/thread conversation memory with 1 hour inactivity expiry
 - Role and guild gating so the bot only works where it should
@@ -49,6 +50,7 @@ The main options live in `.env.example`. The important ones are:
 - `BOT_OWNER_USER_ID`
 - rate limit settings
 - conversation memory settings
+- retrieval tuning settings
 
 ## Behavior Notes
 
@@ -56,6 +58,7 @@ The main options live in `.env.example`. The important ones are:
 - Users must have the configured role to use it.
 - DMs are rejected.
 - Replies are plain text; system slash command responses use embeds.
+- Docs retrieval now uses chunked local RAG with SQLite FTS5.
 - The LLM is instructed not to reveal reasoning traces.
 
 ## Data Files
