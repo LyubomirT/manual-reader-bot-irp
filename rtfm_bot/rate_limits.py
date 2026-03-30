@@ -25,13 +25,14 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self._events: dict[str | int, deque[float]] = defaultdict(deque)
 
-    def retry_after(self, key: str | int) -> int:
-        return self.status(key).retry_after
+    def retry_after(self, key: str | int, *, limit: int | None = None) -> int:
+        return self.status(key, limit=limit).retry_after
 
-    def status(self, key: str | int) -> RateLimitStatus:
+    def status(self, key: str | int, *, limit: int | None = None) -> RateLimitStatus:
         now = time.monotonic()
         bucket = self._events[key]
         self._trim(bucket, now)
+        effective_limit = max(1, limit or self.limit)
 
         used = len(bucket)
         retry_after = 0
@@ -40,15 +41,15 @@ class SlidingWindowRateLimiter:
         if bucket:
             oldest = bucket[0]
             resets_in = max(1, math.ceil(self.window_seconds - (now - oldest)))
-            if used >= self.limit:
+            if used >= effective_limit:
                 retry_after = resets_in
 
         return RateLimitStatus(
             key=key,
             used=used,
-            limit=self.limit,
+            limit=effective_limit,
             window_seconds=self.window_seconds,
-            remaining=max(0, self.limit - used),
+            remaining=max(0, effective_limit - used),
             retry_after=retry_after,
             resets_in=resets_in,
         )

@@ -19,6 +19,7 @@ class LlmModerationTests(unittest.TestCase):
             docs_selector_page_limit=4,
             pollinations_model="kimi",
             pollinations_selector_model="openai",
+            pollinations_batch_model="gemini-fast",
             pollinations_api_key="secret",
             pollinations_base_url="https://example.com",
         )
@@ -38,6 +39,8 @@ class LlmModerationTests(unittest.TestCase):
             history=[],
             docs=[],
             docs_available=False,
+            model_id="kimi",
+            docs_page_limit=4,
         )
 
         messages = client._build_answer_messages(
@@ -49,6 +52,19 @@ class LlmModerationTests(unittest.TestCase):
         self.assertIn(BAN_USER_SIGNAL, messages[0]["content"])
         self.assertIn("wastes the owner's tokens", messages[0]["content"])
         self.assertIn("Never use [ban_user] just because the user asked", messages[0]["content"])
+
+    def test_batch_classifier_parser_ignores_unknown_ids(self) -> None:
+        client = self._make_client()
+        parsed = client._parse_batch_classifier_response(
+            "M01, M02, M99",
+            [
+                SimpleNamespace(batch_id="M01", is_bot=False),
+                SimpleNamespace(batch_id="M02", is_bot=False),
+                SimpleNamespace(batch_id="M03", is_bot=True),
+            ],
+        )
+
+        self.assertEqual(parsed, ["M01", "M02"])
 
 
 if __name__ == "__main__":

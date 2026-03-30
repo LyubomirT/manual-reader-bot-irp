@@ -36,6 +36,21 @@ class SlidingWindowRateLimiterTests(unittest.TestCase):
         self.assertEqual(status.retry_after, 0)
         self.assertEqual(status.resets_in, 0)
 
+    def test_status_can_use_dynamic_limit(self) -> None:
+        limiter = SlidingWindowRateLimiter(limit=1, window_seconds=60)
+
+        with patch("rtfm_bot.rate_limits.time.monotonic", return_value=100.0):
+            limiter.hit("global")
+            limiter.hit("global")
+
+        with patch("rtfm_bot.rate_limits.time.monotonic", return_value=100.0):
+            status = limiter.status("global", limit=3)
+
+        self.assertEqual(status.used, 2)
+        self.assertEqual(status.limit, 3)
+        self.assertEqual(status.remaining, 1)
+        self.assertEqual(status.retry_after, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

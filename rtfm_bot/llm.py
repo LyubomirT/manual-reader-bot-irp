@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from rtfm_bot.config import BotConfig
 from rtfm_bot.docs_cache import CachedDocPage, tokenize
+from rtfm_bot.model_catalog import MODEL_SPECS, get_model_spec
 from rtfm_bot.storage import ConversationMessage
 
 if TYPE_CHECKING:
@@ -26,6 +27,19 @@ class ChatRequest:
     history: list[ConversationMessage]
     docs: list[CachedDocPage]
     docs_available: bool
+    model_id: str
+    docs_page_limit: int
+    is_auto_reply: bool = False
+    audience_names: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class BatchClassifierMessage:
+    batch_id: str
+    author_display_name: str
+    content: str
+    channel_label: str
+    is_bot: bool
 
 
 @dataclass(slots=True)
@@ -45,8 +59,9 @@ class PollinationsClient:
 
     async def generate_reply(self, request: ChatRequest) -> str:
         selection = await self._select_pages(request)
+        model_spec = get_model_spec(request.model_id)
         payload = await self._request_chat_completion(
-            model=self._config.pollinations_model,
+            model=model_spec.id,
             messages=self._build_answer_messages(request, selection),
             temperature=0.7,
             max_tokens=4096,
@@ -58,6 +73,23 @@ class PollinationsClient:
             raise PollinationsError("Pollinations returned an empty response.")
 
         return message
+
+    async def classify_docs_candidates(
+        self,
+        messages: list[BatchClassifierMessage],
+    ) -> list[str]:
+        if not messages:
+            return []
+
+        payload = await self._request_chat_completion(
+            model=self._config.pollinations_batch_model,
+            messages=self._build_batch_classifier_messages(messages),
+            temperature=0.0,
+            max_tokens=180,
+            response_format={"type": "text"},
+        )
+        content = self._extract_message_content(payload)
+        return self._parse_batch_classifier_response(content, messages)
 
     async def _select_pages(self, request: ChatRequest) -> DocSelection:
         if not request.docs_available or not request.docs:
@@ -80,7 +112,11 @@ class PollinationsClient:
             )
 
         selection_text = self._extract_message_content(payload)
-        parsed_selection = self._parse_selection_response(selection_text, indexed_pages)
+        parsed_selection = self._parse_selection_response(
+            selection_text,
+            indexed_pages,
+            limit=request.docs_page_limit,
+        )
         if parsed_selection is None:
             fallback_pages = self._fallback_select_pages(request)
             return DocSelection(
@@ -117,7 +153,7 @@ class PollinationsClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
-        if model == self._config.pollinations_model:
+        if model in MODEL_SPECS and MODEL_SPECS[model].reasoning:
             payload["reasoning_effort"] = "none"
 
         headers = {
@@ -148,6 +184,8 @@ class PollinationsClient:
                     "If the question is about the docs, rely on the provided documentation page context first. "
                     "If the provided docs do not clearly answer the question, say so plainly instead of guessing. "
                     "If the user is just chatting, light small talk is fine, but keep it brief. "
+                    "If multiple users are waiting on the same answer, give one reply that works for the whole mini-group. "
+                    "If this was an automatic docs-helper reply from normal chat, keep it low-key and helpful. "
                     "Be friendly, informal, concise, and a tiny bit silly without going overboard. "
                     "Avoid too much slang, too many jokes, and too many emojis. "
                     "Reply in plain text only with full Markdown support (but no diagrams or LaTeX). "
@@ -172,6 +210,38 @@ class PollinationsClient:
         messages.extend(self._build_conversation_messages(request))
         return messages
 
+    def _build_batch_classifier_messages(
+        self,
+        messages: list[BatchClassifierMessage],
+    ) -> list[dict[str, str]]:
+        transcript_lines = []
+        for entry in messages:
+            actor_kind = "bot-context" if entry.is_bot else "human"
+            transcript_lines.append(
+                f"{entry.batch_id} | {actor_kind} | {entry.channel_label} | "
+                f"{entry.author_display_name}: {entry.content}"
+            )
+
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You triage Discord messages for Reader of the Manual. "
+                    "Return only a comma-separated list of HUMAN message IDs that are directly asking about IntenseRP Next docs, setup, migration, or how the software works. "
+                    "Treat IRP, Intense RP, and IntenseRP Next as aliases for IntenseRP Next. "
+                    "Treat IntenseRP API as a different older project unless the user is explicitly asking about migration or differences. "
+                    "Do not return advanced troubleshooting, log analysis, crash debugging, generic tech chat, casual chatting, or vague reactions. "
+                    "If another bot already seems to have fully answered the question, usually skip it. "
+                    "Return IDs exactly as they appear, in the same order as the matching human messages. "
+                    "If none match, return `none`."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "RECENT_MESSAGES\n\n" + "\n".join(transcript_lines),
+            },
+        ]
+
     def _build_selector_messages(
         self,
         request: ChatRequest,
@@ -184,7 +254,7 @@ class PollinationsClient:
                     "You are a documentation page selector for IntenseRP Next. "
                     "Read the conversation and the full docs corpus, then choose the smallest set of pages needed for the final assistant to answer the latest user message well. "
                     f"Return strict JSON only in this exact shape: {{\"needs_docs\": true, \"page_ids\": [\"P001\"]}}. "
-                    f"You may return at most {self._config.docs_selector_page_limit} page IDs. "
+                    f"You may return at most {request.docs_page_limit} page IDs. "
                     "Use only page IDs that appear in DOCS_CORPUS. "
                     "If the latest message is small talk or does not need docs context, return "
                     "{\"needs_docs\": false, \"page_ids\": []}. "
@@ -227,6 +297,8 @@ class PollinationsClient:
                 "content": self._format_user_message(
                     request.user_display_name,
                     request.question,
+                    audience_names=request.audience_names,
+                    is_auto_reply=request.is_auto_reply,
                 ),
             }
         )
@@ -303,6 +375,8 @@ class PollinationsClient:
         self,
         response_text: str,
         indexed_pages: list[tuple[str, CachedDocPage]],
+        *,
+        limit: int,
     ) -> DocSelection | None:
         cleaned = response_text.strip()
         if not cleaned:
@@ -317,6 +391,7 @@ class PollinationsClient:
                 raw_values=self._extract_page_ids(cleaned),
                 page_lookup=page_lookup,
                 url_lookup=url_lookup,
+                limit=limit,
             )
             if not selected_pages:
                 return None
@@ -326,6 +401,7 @@ class PollinationsClient:
             raw_values=self._extract_selection_values(payload),
             page_lookup=page_lookup,
             url_lookup=url_lookup,
+            limit=limit,
         )
         needs_docs = self._coerce_bool(payload.get("needs_docs"))
 
@@ -400,6 +476,7 @@ class PollinationsClient:
         raw_values: list[str],
         page_lookup: dict[str, CachedDocPage],
         url_lookup: dict[str, CachedDocPage],
+        limit: int,
     ) -> list[CachedDocPage]:
         selected_pages: list[CachedDocPage] = []
         seen_urls: set[str] = set()
@@ -432,7 +509,7 @@ class PollinationsClient:
 
             seen_urls.add(page.url)
             selected_pages.append(page)
-            if len(selected_pages) >= self._config.docs_selector_page_limit:
+            if len(selected_pages) >= limit:
                 break
 
         return selected_pages
@@ -504,12 +581,48 @@ class PollinationsClient:
         scored_pages.sort(key=lambda item: item[0], reverse=True)
         return [
             page
-            for _, page in scored_pages[: self._config.docs_selector_page_limit]
+            for _, page in scored_pages[: request.docs_page_limit]
         ]
 
-    def _format_user_message(self, display_name: str | None, content: str) -> str:
+    def _format_user_message(
+        self,
+        display_name: str | None,
+        content: str,
+        *,
+        audience_names: list[str] | None = None,
+        is_auto_reply: bool = False,
+    ) -> str:
         name = (display_name or "Unknown user").strip() or "Unknown user"
-        return f"Display name: {name}\nMessage: {content.strip()}"
+        lines = [f"Display name: {name}"]
+        if audience_names:
+            unique_names = sorted({value.strip() for value in audience_names if value.strip()})
+            if unique_names:
+                lines.append("Also waiting for this answer: " + ", ".join(unique_names))
+        if is_auto_reply:
+            lines.append("Delivery mode: automatic docs helper reply")
+        lines.append(f"Message: {content.strip()}")
+        return "\n".join(lines)
+
+    def _parse_batch_classifier_response(
+        self,
+        response_text: str,
+        messages: list[BatchClassifierMessage],
+    ) -> list[str]:
+        valid_ids = {entry.batch_id for entry in messages if not entry.is_bot}
+        if not response_text.strip():
+            return []
+
+        if response_text.strip().casefold() == "none":
+            return []
+
+        seen: set[str] = set()
+        selected_ids: list[str] = []
+        for match in re.findall(r"\bM\d{2,3}\b", response_text):
+            if match not in valid_ids or match in seen:
+                continue
+            seen.add(match)
+            selected_ids.append(match)
+        return selected_ids
 
     def _extract_message_content(self, payload: dict[str, object]) -> str:
         choices = payload.get("choices")

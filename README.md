@@ -5,7 +5,9 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 ## Features
 
 - Mention/reply driven chat in public channels
-- Slash commands for `/help`, `/rate_limit_status`, `/update_cache`, and `/clear_memory`
+- Per-user model preferences with a reply button picker and `/model`
+- Batched auto-triage every 30 seconds for likely docs/setup questions in normal chat
+- Slash commands for `/help`, `/model`, `/rate_limit_status`, `/update_cache`, and `/clear_memory`
 - Admin memory inspection via `/inspect_channel_memory` and `/inspect_memory_global`
 - Admin user blocking via `/ban_user` and `/unban_user`
 - Disk-backed docs cache refreshed on startup and every 6 hours
@@ -53,11 +55,13 @@ The main options live in `.env.example`. The important ones are:
 - `POLLINATIONS_API_KEY`
 - `POLLINATIONS_MODEL`
 - `POLLINATIONS_SELECTOR_MODEL`
+- `POLLINATIONS_BATCH_MODEL`
 - `COMMAND_GUILD_ID`
 - `ALLOWED_GUILD_ID`
 - `ALLOWED_ROLE_ID`
 - `BOT_OWNER_USER_ID`
 - `STATUS_ROTATION_INTERVAL_SECONDS`
+- `AUTO_REPLY_BATCH_INTERVAL_SECONDS`
 - rate limit settings
 - conversation memory settings
 - docs cache / selector settings
@@ -65,6 +69,7 @@ The main options live in `.env.example`. The important ones are:
 ## Commands
 
 - `/help` shows the usage summary and command list.
+- `/model` opens the per-user model picker.
 - `/rate_limit_status` shows the current channel and global cooldown buckets.
 - `/clear_memory` clears the saved conversation for the current channel/thread.
 - `/inspect_channel_memory` is an admin-only snapshot of the current channel/thread memory.
@@ -79,6 +84,8 @@ The main options live in `.env.example`. The important ones are:
 - Users must have the configured role to use it.
 - Blocked users cannot chat with the bot or use any slash commands.
 - DMs are rejected.
+- AI replies include a small model/status view with a model-picker button.
+- The bot can proactively answer likely docs/setup questions it spots in public chat after batched triage.
 - Replies are plain text; system slash command responses use embeds.
 - Docs retrieval now uses a model-assisted page selector over the full cached docs corpus.
 - The LLM is instructed not to reveal reasoning traces.

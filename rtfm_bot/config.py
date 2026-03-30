@@ -39,6 +39,7 @@ class BotConfig:
     pollinations_api_key: str
     pollinations_model: str
     pollinations_selector_model: str
+    pollinations_batch_model: str
     pollinations_base_url: str
     command_guild_id: int | None
     allowed_guild_id: int
@@ -54,6 +55,7 @@ class BotConfig:
     global_rate_limit_window_seconds: int
     conversation_max_messages: int
     conversation_inactivity_seconds: int
+    auto_reply_batch_interval_seconds: int
     cache_refresh_interval_seconds: int
     status_rotation_interval_seconds: int
     docs_fetch_concurrency: int
@@ -85,6 +87,9 @@ class BotConfig:
             pollinations_selector_model=(
                 os.getenv("POLLINATIONS_SELECTOR_MODEL", "openai").strip() or "openai"
             ),
+            pollinations_batch_model=(
+                os.getenv("POLLINATIONS_BATCH_MODEL", "gemini-fast").strip() or "gemini-fast"
+            ),
             pollinations_base_url=(
                 os.getenv("POLLINATIONS_BASE_URL", "https://gen.pollinations.ai/v1").rstrip("/")
             ),
@@ -110,12 +115,16 @@ class BotConfig:
                 "APP_VERSION_URL",
                 "https://raw.githubusercontent.com/LyubomirT/intense-rp-next/refs/heads/v2-rewrite/version.json",
             ).strip(),
-            channel_rate_limit_count=_read_int("CHANNEL_RATE_LIMIT_COUNT", 1),
+            channel_rate_limit_count=_read_int("CHANNEL_RATE_LIMIT_COUNT", 2),
             channel_rate_limit_window_seconds=_read_int("CHANNEL_RATE_LIMIT_WINDOW_SECONDS", 60),
-            global_rate_limit_count=_read_int("GLOBAL_RATE_LIMIT_COUNT", 40),
+            global_rate_limit_count=_read_int("GLOBAL_RATE_LIMIT_COUNT", 48),
             global_rate_limit_window_seconds=_read_int("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", 3600),
             conversation_max_messages=_read_int("CONVERSATION_MAX_MESSAGES", 10),
             conversation_inactivity_seconds=_read_int("CONVERSATION_INACTIVITY_SECONDS", 3600),
+            auto_reply_batch_interval_seconds=_read_positive_int(
+                "AUTO_REPLY_BATCH_INTERVAL_SECONDS",
+                30,
+            ),
             cache_refresh_interval_seconds=_read_int("CACHE_REFRESH_INTERVAL_SECONDS", 21600),
             status_rotation_interval_seconds=_read_positive_int(
                 "STATUS_ROTATION_INTERVAL_SECONDS",

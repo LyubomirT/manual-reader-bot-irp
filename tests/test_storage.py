@@ -113,6 +113,23 @@ class ConversationStoreTests(unittest.TestCase):
         self.assertFalse(self.store._is_user_banned_sync(404))
         self.assertIsNone(self.store._get_user_ban_sync(404))
 
+    def test_user_model_preference_persists(self) -> None:
+        self.assertIsNone(self.store._get_user_model_preference_sync(101))
+
+        preference = self.store._set_user_model_preference_sync(
+            user_id=101,
+            model_id="deepseek",
+        )
+
+        self.assertEqual(preference.user_id, 101)
+        self.assertEqual(preference.model_id, "deepseek")
+
+        loaded_preference = self.store._get_user_model_preference_sync(101)
+        self.assertIsNotNone(loaded_preference)
+        assert loaded_preference is not None
+        self.assertEqual(loaded_preference.user_id, 101)
+        self.assertEqual(loaded_preference.model_id, "deepseek")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,13 @@ class UserBan:
     banned_by_name: str | None
 
 
+@dataclass(slots=True)
+class UserModelPreference:
+    user_id: int
+    model_id: str
+    updated_at: datetime
+
+
 class ConversationStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -135,6 +142,23 @@ class ConversationStore:
         async with self._lock:
             return await asyncio.to_thread(self._unban_user_sync, user_id)
 
+    async def get_user_model_preference(self, *, user_id: int) -> UserModelPreference | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._get_user_model_preference_sync, user_id)
+
+    async def set_user_model_preference(
+        self,
+        *,
+        user_id: int,
+        model_id: str,
+    ) -> UserModelPreference:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._set_user_model_preference_sync,
+                user_id,
+                model_id,
+            )
+
     def _initialize_sync(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -183,6 +207,21 @@ class ConversationStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_user_bans_banned_at
                 ON user_bans(banned_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_model_preferences (
+                    user_id INTEGER PRIMARY KEY,
+                    model_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_model_preferences_updated_at
+                ON user_model_preferences(updated_at DESC)
                 """
             )
             connection.commit()
@@ -444,6 +483,57 @@ class ConversationStore:
             connection.commit()
 
         return cursor.rowcount > 0
+
+    def _get_user_model_preference_sync(self, user_id: int) -> UserModelPreference | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT user_id, model_id, updated_at
+                FROM user_model_preferences
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return UserModelPreference(
+            user_id=row["user_id"],
+            model_id=row["model_id"],
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _set_user_model_preference_sync(
+        self,
+        user_id: int,
+        model_id: str,
+    ) -> UserModelPreference:
+        updated_at = datetime.now(UTC)
+        updated_at_iso = updated_at.isoformat()
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_model_preferences (
+                    user_id,
+                    model_id,
+                    updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    model_id = excluded.model_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, model_id, updated_at_iso),
+            )
+            connection.commit()
+
+        return UserModelPreference(
+            user_id=user_id,
+            model_id=model_id,
+            updated_at=updated_at,
+        )
 
     def _purge_scope_if_inactive_sync(
         self,

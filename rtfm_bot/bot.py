@@ -4,6 +4,8 @@ import asyncio
 import logging
 import random
 import re
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 import aiohttp
@@ -14,11 +16,13 @@ from discord.ext import commands
 from rtfm_bot.config import BotConfig
 from rtfm_bot.docs_cache import DocsCacheManager, RefreshResult
 from rtfm_bot.llm import (
+    BatchClassifierMessage,
     ChatRequest,
     PollinationsClient,
     PollinationsError,
     is_ban_user_signal,
 )
+from rtfm_bot.model_catalog import ModelSpec, get_model_spec, iter_model_specs
 from rtfm_bot.rate_limits import RateLimitStatus, SlidingWindowRateLimiter
 from rtfm_bot.storage import (
     BAN_SOURCE_AI,
@@ -33,13 +37,32 @@ from rtfm_bot.statuses import BotStatusSpec, DEFAULT_ROTATING_STATUSES, choose_n
 LOGGER = logging.getLogger(__name__)
 MAX_MEMORY_SCOPE_OPTIONS = 25
 MEMORY_VIEW_TIMEOUT_SECONDS = 300
+MODEL_RESPONSE_VIEW_TIMEOUT_SECONDS = 1800
 INITIAL_STATUS_UPDATE_DELAY_SECONDS = 5
+LOADER_EMOJI = "<a:loader:1488104843108290570>"
+BATCH_QUEUE_MAX_MESSAGES = 250
+AUTO_REPLY_SIMILARITY_THRESHOLD = 0.72
 AI_BAN_BLOCK_MESSAGE = "You're blocked from using Reader of the Manual now."
 AI_BAN_NOTICE_MESSAGE = (
     "The AI blocked you for suspected abuse, weird messaging, or wasting the owner's tokens. "
     "Only the bot owner can undo an AI block."
 )
 GENERIC_BANNED_MESSAGE = "You're blocked from using Reader of the Manual."
+
+
+@dataclass(slots=True)
+class PendingStoredMessage:
+    author_id: int | None
+    author_name: str | None
+    content: str
+
+
+@dataclass(slots=True)
+class QueuedBatchMessage:
+    message: discord.Message
+    content: str
+    author_display_name: str
+    candidate: bool
 
 
 def _truncate_text(value: str | None, limit: int) -> str:
@@ -296,6 +319,155 @@ class MemoryInspectorView(discord.ui.View):
         self.next_page.disabled = self.page_index >= self.total_pages - 1 or self.total_pages <= 1
 
 
+class ModelPickerSelect(discord.ui.Select):
+    def __init__(self, parent: "ModelPickerView") -> None:
+        self._picker_view = parent
+        options = [
+            discord.SelectOption(
+                label=model_spec.display_name[:100],
+                value=model_spec.id,
+                description=parent.bot._format_model_picker_option(model_spec),
+                emoji=model_spec.heaviness_emoji,
+                default=model_spec.id == parent.current_model_id,
+            )
+            for model_spec in iter_model_specs()
+        ]
+        super().__init__(
+            placeholder="Pick your default model",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction[Any]) -> None:
+        await self._picker_view.handle_selection(interaction, self.values[0])
+
+
+class ModelPickerView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        bot: "ReaderBot",
+        actor_id: int,
+        current_model_id: str,
+    ) -> None:
+        super().__init__(timeout=MEMORY_VIEW_TIMEOUT_SECONDS)
+        self.bot = bot
+        self.actor_id = actor_id
+        self.current_model_id = current_model_id
+        self.message: discord.InteractionMessage | None = None
+        self.model_select = ModelPickerSelect(self)
+        self.add_item(self.model_select)
+
+    async def handle_selection(
+        self,
+        interaction: discord.Interaction[Any],
+        model_id: str,
+    ) -> None:
+        if not await self._ensure_actor(interaction):
+            return
+        await self.bot.store.set_user_model_preference(
+            user_id=interaction.user.id,
+            model_id=model_id,
+        )
+        self.current_model_id = model_id
+        self.model_select.options = [
+            discord.SelectOption(
+                label=model_spec.display_name[:100],
+                value=model_spec.id,
+                description=self.bot._format_model_picker_option(model_spec),
+                emoji=model_spec.heaviness_emoji,
+                default=model_spec.id == model_id,
+            )
+            for model_spec in iter_model_specs()
+        ]
+        await interaction.response.edit_message(
+            embed=self.bot._build_model_picker_embed(get_model_spec(model_id)),
+            view=self,
+        )
+
+    async def on_timeout(self) -> None:
+        self.model_select.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            return
+
+    async def _ensure_actor(self, interaction: discord.Interaction[Any]) -> bool:
+        if interaction.user.id == self.actor_id:
+            return True
+        await interaction.response.send_message(
+            "This model picker belongs to someone else.",
+            ephemeral=True,
+        )
+        return False
+
+
+class ResponseStatsView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        bot: "ReaderBot",
+        model_spec: ModelSpec,
+    ) -> None:
+        super().__init__(timeout=MODEL_RESPONSE_VIEW_TIMEOUT_SECONDS)
+        self.bot = bot
+        self.model_spec = model_spec
+        self.message: discord.Message | None = None
+
+        self.model_button = discord.ui.Button(
+            label=model_spec.button_label[:80],
+            style=discord.ButtonStyle.secondary,
+        )
+        self.model_button.callback = self._open_model_picker
+        self.add_item(self.model_button)
+        self.add_item(
+            discord.ui.Button(
+                label=bot._format_model_rate_button_label(model_spec),
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label=bot._format_model_context_button_label(model_spec),
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+        )
+
+    async def on_timeout(self) -> None:
+        self.model_button.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            return
+
+    async def _open_model_picker(self, interaction: discord.Interaction[Any]) -> None:
+        if not await self.bot._ensure_model_picker_access(interaction):
+            return
+
+        current_model = await self.bot._get_user_model_spec(interaction.user.id)
+        picker_view = ModelPickerView(
+            bot=self.bot,
+            actor_id=interaction.user.id,
+            current_model_id=current_model.id,
+        )
+        await interaction.response.send_message(
+            embed=self.bot._build_model_picker_embed(current_model),
+            view=picker_view,
+            ephemeral=True,
+        )
+        try:
+            picker_view.message = await interaction.original_response()
+        except discord.HTTPException:
+            picker_view.message = None
+
+
 class ReaderBot(commands.Bot):
     def __init__(self, config: BotConfig) -> None:
         intents = discord.Intents.default()
@@ -323,9 +495,16 @@ class ReaderBot(commands.Bot):
             window_seconds=config.global_rate_limit_window_seconds,
         )
         self._cache_refresh_task: asyncio.Task[None] | None = None
+        self._batch_queue_task: asyncio.Task[None] | None = None
         self._status_rotation_task: asyncio.Task[None] | None = None
         self._status_random = random.Random()
         self._current_status: BotStatusSpec | None = None
+        self._batch_queue: list[QueuedBatchMessage] = []
+        self._batch_queue_lock = asyncio.Lock()
+        self._conversation_storage_limit = max(
+            model_spec.scaled_history_limit(config.conversation_max_messages)
+            for model_spec in iter_model_specs()
+        )
         self._register_commands()
 
     async def setup_hook(self) -> None:
@@ -352,6 +531,10 @@ class ReaderBot(commands.Bot):
             self._cache_refresh_loop(),
             name="docs-cache-refresh-loop",
         )
+        self._batch_queue_task = asyncio.create_task(
+            self._batch_queue_loop(),
+            name="batch-docs-triage-loop",
+        )
         self._status_rotation_task = asyncio.create_task(
             self._status_rotation_loop(),
             name="bot-status-rotation-loop",
@@ -373,6 +556,12 @@ class ReaderBot(commands.Bot):
                 await self._cache_refresh_task
             except asyncio.CancelledError:
                 pass
+        if self._batch_queue_task is not None:
+            self._batch_queue_task.cancel()
+            try:
+                await self._batch_queue_task
+            except asyncio.CancelledError:
+                pass
         if self._status_rotation_task is not None:
             self._status_rotation_task.cancel()
             try:
@@ -392,6 +581,18 @@ class ReaderBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
+            if (
+                message.guild is not None
+                and message.guild.id == self.config.allowed_guild_id
+                and (self.user is None or message.author.id != self.user.id)
+            ):
+                content = self._prepare_message_content(message)
+                if self._content_has_substance(content):
+                    await self._enqueue_batch_message(
+                        message,
+                        content=content,
+                        candidate=False,
+                    )
             return
 
         if message.guild is None:
@@ -403,7 +604,19 @@ class ReaderBot(commands.Bot):
         if message.guild.id != self.config.allowed_guild_id:
             return
 
-        if not await self._message_targets_bot(message):
+        targets_bot = await self._message_targets_bot(message)
+        if not targets_bot:
+            if (
+                self._member_has_allowed_role(message.author)
+                and await self._get_user_ban(message.author.id) is None
+            ):
+                content = self._prepare_message_content(message)
+                if self._content_has_substance(content):
+                    await self._enqueue_batch_message(
+                        message,
+                        content=content,
+                        candidate=True,
+                    )
             return
 
         if await self._handle_banned_message(message):
@@ -416,27 +629,8 @@ class ReaderBot(commands.Bot):
             )
             return
 
-        if message.channel.id is None:
-            return
-
-        channel_retry_after = self.channel_rate_limiter.retry_after(message.channel.id)
-        if channel_retry_after:
-            await message.reply(
-                f"This channel is on cooldown for {channel_retry_after}s. Try me again in a minute.",
-                mention_author=False,
-            )
-            return
-
-        global_retry_after = self.global_rate_limiter.retry_after("global")
-        if global_retry_after:
-            await message.reply(
-                f"I'm rate limited right now. Give me about {global_retry_after}s to chill.",
-                mention_author=False,
-            )
-            return
-
-        content = self._strip_bot_mentions(message.content)
-        if not content:
+        content = self._prepare_message_content(message)
+        if not self._content_has_substance(content):
             if message.attachments:
                 await message.reply(
                     "I can't read attachments yet. Toss me a text question instead.",
@@ -449,73 +643,20 @@ class ReaderBot(commands.Bot):
                 )
             return
 
-        self.channel_rate_limiter.hit(message.channel.id)
-        self.global_rate_limiter.hit("global")
-
-        history = await self.store.get_recent_messages(
-            scope_id=message.channel.id,
-            guild_id=message.guild.id,
-            limit=self.config.conversation_max_messages,
-            inactivity_seconds=self.config.conversation_inactivity_seconds,
-        )
-        request = ChatRequest(
-            question=content,
-            user_display_name=message.author.display_name,
-            history=history,
-            docs=self.docs_cache.get_pages(),
-            docs_available=self.docs_cache.available,
-        )
-
-        try:
-            async with message.channel.typing():
-                response_text = await self._generate_reply(request)
-        except PollinationsError as exc:
-            LOGGER.exception("Pollinations request failed.")
-            await message.reply(
-                f"I tripped over the AI request just now: {exc}",
-                mention_author=False,
-            )
-            return
-        except Exception:
-            LOGGER.exception("Unexpected error while generating a reply.")
-            await message.reply(
-                "Something broke while I was digging through the manual. Please try again in a bit.",
-                mention_author=False,
-            )
-            return
-
-        if is_ban_user_signal(response_text):
-            try:
-                await self._apply_ai_ban(message)
-            except Exception:
-                LOGGER.exception("Failed to apply an AI-triggered ban.")
-                await message.reply(
-                    "I tripped over the moderation bit just now. Please poke the bot owner.",
-                    mention_author=False,
-                )
-            return
-
-        await self._send_reply(message, response_text)
-
-        await self.store.append_message(
-            scope_id=message.channel.id,
-            guild_id=message.guild.id,
-            role="user",
+        model_spec = await self._get_user_model_spec(message.author.id)
+        await self._handle_ai_request(
+            message,
             content=content,
-            author_id=message.author.id,
-            author_name=message.author.display_name,
-            max_messages=self.config.conversation_max_messages,
-            inactivity_seconds=self.config.conversation_inactivity_seconds,
-        )
-        await self.store.append_message(
-            scope_id=message.channel.id,
-            guild_id=message.guild.id,
-            role="assistant",
-            content=response_text,
-            author_id=self.user.id if self.user else None,
-            author_name=self.user.display_name if self.user else "Reader of the Manual",
-            max_messages=self.config.conversation_max_messages,
-            inactivity_seconds=self.config.conversation_inactivity_seconds,
+            model_spec=model_spec,
+            stored_messages=[
+                PendingStoredMessage(
+                    author_id=message.author.id,
+                    author_name=message.author.display_name,
+                    content=content,
+                )
+            ],
+            target_users=[],
+            auto_reply=False,
         )
 
     async def _generate_reply(self, request: ChatRequest) -> str:
@@ -528,6 +669,285 @@ class ReaderBot(commands.Bot):
             return "I came back empty-handed there. Mind trying that one again?"
 
         return clean_text
+
+    async def _handle_ai_request(
+        self,
+        message: discord.Message,
+        *,
+        content: str,
+        model_spec: ModelSpec,
+        stored_messages: list[PendingStoredMessage],
+        target_users: list[discord.abc.User],
+        auto_reply: bool,
+    ) -> bool:
+        if message.guild is None or message.channel.id is None:
+            return False
+
+        channel_status = self._channel_rate_status_for_model(message.channel.id, model_spec)
+        if channel_status.retry_after:
+            if not auto_reply:
+                await message.reply(
+                    f"This channel is on cooldown for {channel_status.retry_after}s. Try me again in a minute.",
+                    mention_author=False,
+                )
+            return False
+
+        global_status = self._global_rate_status_for_model(model_spec)
+        if global_status.retry_after:
+            if not auto_reply:
+                await message.reply(
+                    f"I'm rate limited right now. Give me about {global_status.retry_after}s to chill.",
+                    mention_author=False,
+                )
+            return False
+
+        self.channel_rate_limiter.hit(message.channel.id)
+        self.global_rate_limiter.hit("global")
+
+        history_limit = model_spec.scaled_history_limit(self.config.conversation_max_messages)
+        docs_page_limit = model_spec.scaled_docs_limit(self.config.docs_selector_page_limit)
+        history = await self.store.get_recent_messages(
+            scope_id=message.channel.id,
+            guild_id=message.guild.id,
+            limit=history_limit,
+            inactivity_seconds=self.config.conversation_inactivity_seconds,
+        )
+        audience_names = [
+            self._display_name_for_user(user)
+            for user in target_users
+            if user.id != message.author.id
+        ]
+        request = ChatRequest(
+            question=content,
+            user_display_name=message.author.display_name,
+            history=history,
+            docs=self.docs_cache.get_pages(),
+            docs_available=self.docs_cache.available,
+            model_id=model_spec.id,
+            docs_page_limit=docs_page_limit,
+            is_auto_reply=auto_reply,
+            audience_names=audience_names,
+        )
+
+        loader_added = await self._maybe_add_loader_reaction(message)
+        try:
+            async with message.channel.typing():
+                response_text = await self._generate_reply(request)
+        except PollinationsError as exc:
+            LOGGER.exception("Pollinations request failed.")
+            if not auto_reply:
+                await message.reply(
+                    f"I tripped over the AI request just now: {exc}",
+                    mention_author=False,
+                )
+            return False
+        except Exception:
+            LOGGER.exception("Unexpected error while generating a reply.")
+            if not auto_reply:
+                await message.reply(
+                    "Something broke while I was digging through the manual. Please try again in a bit.",
+                    mention_author=False,
+                )
+            return False
+        finally:
+            if loader_added:
+                await self._maybe_remove_loader_reaction(message)
+
+        if is_ban_user_signal(response_text):
+            try:
+                await self._apply_ai_ban(message)
+            except Exception:
+                LOGGER.exception("Failed to apply an AI-triggered ban.")
+                if not auto_reply:
+                    await message.reply(
+                        "I tripped over the moderation bit just now. Please poke the bot owner.",
+                        mention_author=False,
+                    )
+            return False
+
+        try:
+            await self._send_reply(
+                message,
+                response_text,
+                model_spec=model_spec,
+                target_users=target_users if len(target_users) > 1 else [],
+            )
+        except discord.HTTPException:
+            LOGGER.exception("Failed to send the generated reply.")
+            return False
+
+        for stored_message in stored_messages:
+            await self.store.append_message(
+                scope_id=message.channel.id,
+                guild_id=message.guild.id,
+                role="user",
+                content=stored_message.content,
+                author_id=stored_message.author_id,
+                author_name=stored_message.author_name,
+                max_messages=self._conversation_storage_limit,
+                inactivity_seconds=self.config.conversation_inactivity_seconds,
+            )
+        await self.store.append_message(
+            scope_id=message.channel.id,
+            guild_id=message.guild.id,
+            role="assistant",
+            content=response_text,
+            author_id=self.user.id if self.user else None,
+            author_name=self.user.display_name if self.user else "Reader of the Manual",
+            max_messages=self._conversation_storage_limit,
+            inactivity_seconds=self.config.conversation_inactivity_seconds,
+        )
+        return True
+
+    async def _batch_queue_loop(self) -> None:
+        await self.wait_until_ready()
+        while True:
+            try:
+                await asyncio.sleep(self.config.auto_reply_batch_interval_seconds)
+                await self._process_batch_queue()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Unexpected error in the batched docs triage loop.")
+
+    async def _enqueue_batch_message(
+        self,
+        message: discord.Message,
+        *,
+        content: str,
+        candidate: bool,
+    ) -> None:
+        entry = QueuedBatchMessage(
+            message=message,
+            content=content,
+            author_display_name=self._display_name_for_user(message.author),
+            candidate=candidate,
+        )
+        async with self._batch_queue_lock:
+            self._batch_queue.append(entry)
+            if len(self._batch_queue) > BATCH_QUEUE_MAX_MESSAGES:
+                self._batch_queue = self._batch_queue[-BATCH_QUEUE_MAX_MESSAGES:]
+
+    async def _process_batch_queue(self) -> None:
+        async with self._batch_queue_lock:
+            if not self._batch_queue:
+                return
+            queued_messages = list(self._batch_queue)
+            self._batch_queue.clear()
+
+        if self.llm is None:
+            return
+        if not any(entry.candidate for entry in queued_messages):
+            return
+
+        classifier_messages: list[BatchClassifierMessage] = []
+        entry_by_batch_id: dict[str, QueuedBatchMessage] = {}
+        for index, entry in enumerate(queued_messages, start=1):
+            batch_id = f"M{index:02d}"
+            classifier_messages.append(
+                BatchClassifierMessage(
+                    batch_id=batch_id,
+                    author_display_name=entry.author_display_name,
+                    content=entry.content,
+                    channel_label=self._format_batch_channel_label(entry.message),
+                    is_bot=not entry.candidate,
+                )
+            )
+            entry_by_batch_id[batch_id] = entry
+
+        try:
+            selected_ids = await self.llm.classify_docs_candidates(classifier_messages)
+        except PollinationsError:
+            LOGGER.exception("Batched docs classifier failed.")
+            return
+
+        selected_entries = [
+            entry_by_batch_id[batch_id]
+            for batch_id in selected_ids
+            if batch_id in entry_by_batch_id and entry_by_batch_id[batch_id].candidate
+        ]
+        if not selected_entries:
+            return
+
+        for cluster in self._cluster_batch_entries(selected_entries):
+            latest_entry = cluster[-1]
+            model_spec = await self._get_user_model_spec(latest_entry.message.author.id)
+            target_users: list[discord.abc.User] = []
+            seen_user_ids: set[int] = set()
+            for entry in cluster:
+                if entry.message.author.id in seen_user_ids:
+                    continue
+                seen_user_ids.add(entry.message.author.id)
+                target_users.append(entry.message.author)
+
+            await self._handle_ai_request(
+                latest_entry.message,
+                content=latest_entry.content,
+                model_spec=model_spec,
+                stored_messages=[
+                    PendingStoredMessage(
+                        author_id=entry.message.author.id,
+                        author_name=entry.author_display_name,
+                        content=entry.content,
+                    )
+                    for entry in cluster
+                ],
+                target_users=target_users,
+                auto_reply=True,
+            )
+
+    def _cluster_batch_entries(
+        self,
+        entries: list[QueuedBatchMessage],
+    ) -> list[list[QueuedBatchMessage]]:
+        remaining = sorted(entries, key=lambda entry: entry.message.created_at)
+        clusters: list[list[QueuedBatchMessage]] = []
+
+        while remaining:
+            anchor = remaining.pop()
+            cluster = [anchor]
+            unmatched: list[QueuedBatchMessage] = []
+            for candidate in remaining:
+                if self._queued_messages_are_similar(candidate, anchor):
+                    cluster.append(candidate)
+                else:
+                    unmatched.append(candidate)
+            remaining = unmatched
+            clusters.append(sorted(cluster, key=lambda entry: entry.message.created_at))
+
+        clusters.reverse()
+        return clusters
+
+    def _queued_messages_are_similar(
+        self,
+        first: QueuedBatchMessage,
+        second: QueuedBatchMessage,
+    ) -> bool:
+        if first.message.channel.id != second.message.channel.id:
+            return False
+
+        first_text = self._normalize_similarity_text(first.content)
+        second_text = self._normalize_similarity_text(second.content)
+        if not first_text or not second_text:
+            return False
+
+        first_tokens = set(re.findall(r"[a-z0-9]+", first_text))
+        second_tokens = set(re.findall(r"[a-z0-9]+", second_text))
+        token_overlap = 0.0
+        if first_tokens and second_tokens:
+            token_overlap = len(first_tokens & second_tokens) / max(
+                1,
+                min(len(first_tokens), len(second_tokens)),
+            )
+
+        sequence_score = SequenceMatcher(None, first_text, second_text).ratio()
+        return max(token_overlap, sequence_score) >= AUTO_REPLY_SIMILARITY_THRESHOLD
+
+    def _normalize_similarity_text(self, content: str) -> str:
+        tokens = tokenize(content)
+        if tokens:
+            return " ".join(tokens)
+        return re.sub(r"\s+", " ", content.casefold()).strip()
 
     async def _cache_refresh_loop(self) -> None:
         while True:
@@ -629,6 +1049,158 @@ class ReaderBot(commands.Bot):
             return False
 
         return referenced_message.author.id == self.user.id
+
+    def _prepare_message_content(self, message: discord.Message) -> str:
+        content = message.content
+
+        for mentioned_user in message.mentions:
+            display_name = self._display_name_for_user(mentioned_user)
+            placeholder = f"[mention of ({display_name})]"
+            content = re.sub(rf"<@!?{mentioned_user.id}>", placeholder, content)
+
+        for mentioned_role in message.role_mentions:
+            content = content.replace(
+                f"<@&{mentioned_role.id}>",
+                f"[mention of role ({mentioned_role.name})]",
+            )
+
+        if message.guild is not None:
+            def replace_channel(match: re.Match[str]) -> str:
+                channel_id = int(match.group(1))
+                channel = message.guild.get_channel(channel_id) or message.guild.get_thread(channel_id)
+                if channel is None:
+                    return "[mention of channel (unknown)]"
+                return f"[mention of channel ({channel.name})]"
+
+            content = re.sub(r"<#(\d+)>", replace_channel, content)
+
+        return re.sub(r"\s+", " ", content).strip(" \n\t,;:-")
+
+    def _content_has_substance(self, content: str) -> bool:
+        stripped = re.sub(r"\[mention of [^\]]+\]", " ", content, flags=re.IGNORECASE)
+        stripped = re.sub(r"\[mention of role [^\]]+\]", " ", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\[mention of channel [^\]]+\]", " ", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"[^a-z0-9]+", "", stripped.casefold())
+        return bool(stripped)
+
+    async def _get_user_model_spec(self, user_id: int) -> ModelSpec:
+        preference = await self.store.get_user_model_preference(user_id=user_id)
+        if preference is not None:
+            return get_model_spec(preference.model_id)
+        return get_model_spec(self.config.pollinations_model)
+
+    async def _ensure_model_picker_access(
+        self,
+        interaction: discord.Interaction[Any],
+    ) -> bool:
+        ban = await self._get_user_ban(interaction.user.id)
+        if ban is not None:
+            await interaction.response.send_message(
+                embed=self._build_banned_embed(),
+                ephemeral=True,
+            )
+            return False
+
+        if not self._interaction_is_allowed(interaction):
+            await interaction.response.send_message(
+                embed=self._build_embed(
+                    title="Nope",
+                    description="You need the helper role to change your model here.",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    def _format_window_short(self, seconds: int) -> str:
+        if seconds % 3600 == 0:
+            return f"{seconds // 3600}h"
+        if seconds % 60 == 0:
+            return f"{seconds // 60}m"
+        return f"{seconds}s"
+
+    def _format_model_rate_button_label(self, model_spec: ModelSpec) -> str:
+        channel_limit = model_spec.scaled_rate_limit(self.config.channel_rate_limit_count)
+        global_limit = model_spec.scaled_rate_limit(self.config.global_rate_limit_count)
+        return (
+            f"{channel_limit}/{self._format_window_short(self.config.channel_rate_limit_window_seconds)}"
+            f" • {global_limit}/{self._format_window_short(self.config.global_rate_limit_window_seconds)}"
+        )[:80]
+
+    def _format_model_context_button_label(self, model_spec: ModelSpec) -> str:
+        history_limit = model_spec.scaled_history_limit(self.config.conversation_max_messages)
+        docs_limit = model_spec.scaled_docs_limit(self.config.docs_selector_page_limit)
+        return f"{history_limit} mem • {docs_limit} docs • {model_spec.context_label}"[:80]
+
+    def _format_model_picker_option(self, model_spec: ModelSpec) -> str:
+        return (
+            f"{model_spec.heaviness_name} • {model_spec.context_label} ctx • "
+            f"{model_spec.scaled_history_limit(self.config.conversation_max_messages)} mem"
+        )[:100]
+
+    def _build_model_picker_embed(self, model_spec: ModelSpec) -> discord.Embed:
+        embed = self._build_embed(
+            title="Pick Your Model",
+            description=(
+                "This changes your personal default model for future answers. "
+                "Use the selector below whenever you want to swap."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Current", value=model_spec.button_label, inline=False)
+        embed.add_field(
+            name="Heaviness",
+            value=model_spec.heaviness_label,
+            inline=True,
+        )
+        embed.add_field(
+            name="Rate",
+            value=self._format_model_rate_button_label(model_spec),
+            inline=True,
+        )
+        embed.add_field(
+            name="Context",
+            value=self._format_model_context_button_label(model_spec),
+            inline=False,
+        )
+        return embed
+
+    def _channel_rate_status_for_model(
+        self,
+        channel_id: int,
+        model_spec: ModelSpec,
+    ) -> RateLimitStatus:
+        limit = model_spec.scaled_rate_limit(self.config.channel_rate_limit_count)
+        return self.channel_rate_limiter.status(channel_id, limit=limit)
+
+    def _global_rate_status_for_model(self, model_spec: ModelSpec) -> RateLimitStatus:
+        limit = model_spec.scaled_rate_limit(self.config.global_rate_limit_count)
+        return self.global_rate_limiter.status("global", limit=limit)
+
+    def _format_batch_channel_label(self, message: discord.Message) -> str:
+        guild = message.guild
+        if guild is None:
+            return "#unknown"
+        return self._format_scope_label(guild, message.channel.id)
+
+    async def _maybe_add_loader_reaction(self, message: discord.Message) -> bool:
+        emoji = discord.PartialEmoji.from_str(LOADER_EMOJI)
+        try:
+            await message.add_reaction(emoji)
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+        return True
+
+    async def _maybe_remove_loader_reaction(self, message: discord.Message) -> None:
+        if self.user is None:
+            return
+        emoji = discord.PartialEmoji.from_str(LOADER_EMOJI)
+        try:
+            await message.remove_reaction(emoji, self.user)
+        except (discord.Forbidden, discord.HTTPException):
+            return
 
     def _member_has_allowed_role(self, member: discord.abc.User | discord.Member) -> bool:
         if not isinstance(member, discord.Member):
@@ -736,12 +1308,46 @@ class ReaderBot(commands.Bot):
         stripped = re.sub(mention_pattern, " ", content)
         return re.sub(r"\s+", " ", stripped).strip(" \n\t,;:-")
 
-    async def _send_reply(self, message: discord.Message, content: str) -> None:
-        chunks = self._chunk_message(content)
+    async def _send_reply(
+        self,
+        message: discord.Message,
+        content: str,
+        *,
+        model_spec: ModelSpec,
+        target_users: list[discord.abc.User],
+    ) -> None:
+        allowed_mentions = None
+        prefix = ""
+        if target_users:
+            unique_users: list[discord.abc.User] = []
+            seen_user_ids: set[int] = set()
+            for user in target_users:
+                if user.id in seen_user_ids:
+                    continue
+                seen_user_ids.add(user.id)
+                unique_users.append(user)
+            if unique_users:
+                prefix = " ".join(user.mention for user in unique_users)
+                allowed_mentions = discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=unique_users,
+                    replied_user=False,
+                )
+
+        full_content = f"{prefix}\n{content}" if prefix else content
+        chunks = self._chunk_message(full_content)
         if not chunks:
             chunks = ["I somehow managed to say nothing. Impressive, but not useful."]
 
-        await message.reply(chunks[0], mention_author=False)
+        view = ResponseStatsView(bot=self, model_spec=model_spec)
+        sent_message = await message.reply(
+            chunks[0],
+            mention_author=False,
+            allowed_mentions=allowed_mentions,
+            view=view,
+        )
+        view.message = sent_message
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
 
@@ -840,7 +1446,7 @@ class ReaderBot(commands.Bot):
         messages = await self.store.get_recent_messages(
             scope_id=scope_id,
             guild_id=guild.id,
-            limit=self.config.conversation_max_messages,
+            limit=self._conversation_storage_limit,
             inactivity_seconds=self.config.conversation_inactivity_seconds,
         )
 
@@ -861,7 +1467,7 @@ class ReaderBot(commands.Bot):
             summary_lines.append(
                 f"Last activity: {discord.utils.format_dt(summary.last_activity_at, style='R')}"
             )
-        summary_lines.append(f"Message cap: {self.config.conversation_max_messages}")
+        summary_lines.append(f"Message cap: {self._conversation_storage_limit}")
         summary_lines.append(
             f"Inactivity expiry: {self.config.conversation_inactivity_seconds}s"
         )
@@ -908,12 +1514,19 @@ class ReaderBot(commands.Bot):
             lines.append(f"Retry after: {status.retry_after}s")
         return "\n".join(lines)
 
-    def _build_rate_limit_status_embed(self, channel_id: int) -> discord.Embed:
-        channel_status = self.channel_rate_limiter.status(channel_id)
-        global_status = self.global_rate_limiter.status("global")
+    def _build_rate_limit_status_embed(
+        self,
+        channel_id: int,
+        model_spec: ModelSpec,
+    ) -> discord.Embed:
+        channel_status = self._channel_rate_status_for_model(channel_id, model_spec)
+        global_status = self._global_rate_status_for_model(model_spec)
         embed = self._build_embed(
             title="Rate Limit Status",
-            description="Current cooldown buckets for this channel and the whole bot.",
+            description=(
+                "Current cooldown buckets for this channel and the whole bot "
+                f"using your {model_spec.display_name} limits."
+            ),
             color=discord.Color.blurple(),
         )
         embed.add_field(
@@ -940,7 +1553,7 @@ class ReaderBot(commands.Bot):
         )
         embed.add_field(
             name="Public Commands",
-            value="/help\n/rate_limit_status",
+            value="/help\n/model\n/rate_limit_status",
             inline=False,
         )
         embed.add_field(
@@ -1277,6 +1890,27 @@ class ReaderBot(commands.Bot):
                 ephemeral=True,
             )
 
+        @self.tree.command(name="model", description="Pick your default answer model.")
+        async def model_command(interaction: discord.Interaction[Any]) -> None:
+            if not await self._ensure_model_picker_access(interaction):
+                return
+
+            current_model = await self._get_user_model_spec(interaction.user.id)
+            picker_view = ModelPickerView(
+                bot=self,
+                actor_id=interaction.user.id,
+                current_model_id=current_model.id,
+            )
+            await interaction.response.send_message(
+                embed=self._build_model_picker_embed(current_model),
+                view=picker_view,
+                ephemeral=True,
+            )
+            try:
+                picker_view.message = await interaction.original_response()
+            except discord.HTTPException:
+                picker_view.message = None
+
         @self.tree.command(
             name="rate_limit_status",
             description="Show the current channel and global cooldown status.",
@@ -1304,8 +1938,9 @@ class ReaderBot(commands.Bot):
                 )
                 return
 
+            model_spec = await self._get_user_model_spec(interaction.user.id)
             await interaction.response.send_message(
-                embed=self._build_rate_limit_status_embed(interaction.channel_id),
+                embed=self._build_rate_limit_status_embed(interaction.channel_id, model_spec),
                 ephemeral=True,
             )
 
