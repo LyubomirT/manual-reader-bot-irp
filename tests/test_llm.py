@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from rtfm_bot.llm import (
     BAN_USER_SIGNAL,
     ChatRequest,
+    BatchClassifierMessage,
     DocSelection,
     PollinationsClient,
     is_ban_user_signal,
@@ -65,6 +66,37 @@ class LlmModerationTests(unittest.TestCase):
         )
 
         self.assertEqual(parsed, ["M01", "M02"])
+
+    def test_batch_classifier_prompt_uses_context_sections_and_guardrails(self) -> None:
+        client = self._make_client()
+        messages = client._build_batch_classifier_messages(
+            [
+                BatchClassifierMessage(
+                    batch_id="M01",
+                    author_display_name="Lyu [MAINTAINER]",
+                    content="how do i enable moonshot thinking?",
+                    channel_label="#docs-help",
+                    created_at_label="2026-04-01 12:30 UTC",
+                    is_bot=False,
+                )
+            ],
+            conversation_prefix=(
+                "#docs-help\n"
+                "2026-04-01 12:20 UTC | Alice: moonshot was being weird earlier"
+            ),
+        )
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("RECENT_CHANNEL_CONTEXT only as background", messages[0]["content"])
+        self.assertIn("clearly asking for help", messages[0]["content"])
+        self.assertIn("casual mention of IRP/docs without asking for help", messages[0]["content"])
+        self.assertIn("If a message is ambiguous, lean toward skipping it.", messages[0]["content"])
+
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("RECENT_CHANNEL_CONTEXT", messages[1]["content"])
+        self.assertIn("QUEUED_MESSAGES", messages[1]["content"])
+        self.assertIn("2026-04-01 12:30 UTC", messages[1]["content"])
+        self.assertIn("Lyu [MAINTAINER]", messages[1]["content"])
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -41,6 +42,8 @@ MODEL_RESPONSE_VIEW_TIMEOUT_SECONDS = 1800
 INITIAL_STATUS_UPDATE_DELAY_SECONDS = 5
 LOADER_EMOJI = "<a:loader:1488104843108290570>"
 BATCH_QUEUE_MAX_MESSAGES = 250
+BATCH_CONTEXT_MAX_USER_MESSAGES = 15
+BATCH_CONTEXT_HISTORY_FETCH_LIMIT = 100
 AUTO_REPLY_SIMILARITY_THRESHOLD = 0.72
 AI_BAN_BLOCK_MESSAGE = "You're blocked from using Reader of the Manual now."
 AI_BAN_NOTICE_MESSAGE = (
@@ -820,7 +823,7 @@ class ReaderBot(commands.Bot):
         entry = QueuedBatchMessage(
             message=message,
             content=content,
-            author_display_name=self._display_name_for_user(message.author),
+            author_display_name=self._display_name_for_batch_model(message.author),
             candidate=candidate,
         )
         async with self._batch_queue_lock:
@@ -850,13 +853,20 @@ class ReaderBot(commands.Bot):
                     author_display_name=entry.author_display_name,
                     content=entry.content,
                     channel_label=self._format_batch_channel_label(entry.message),
+                    created_at_label=self._format_batch_timestamp(entry.message.created_at),
                     is_bot=not entry.candidate,
                 )
             )
             entry_by_batch_id[batch_id] = entry
 
+        conversation_prefix = await self._build_batch_classifier_context_prefix(
+            queued_messages
+        )
         try:
-            selected_ids = await self.llm.classify_docs_candidates(classifier_messages)
+            selected_ids = await self.llm.classify_docs_candidates(
+                classifier_messages,
+                conversation_prefix=conversation_prefix,
+            )
         except PollinationsError:
             LOGGER.exception("Batched docs classifier failed.")
             return
@@ -917,6 +927,72 @@ class ReaderBot(commands.Bot):
 
         clusters.reverse()
         return clusters
+
+    async def _build_batch_classifier_context_prefix(
+        self,
+        queued_messages: list[QueuedBatchMessage],
+    ) -> str:
+        queued_ids_by_channel: dict[int, set[int]] = {}
+        representative_messages: dict[int, discord.Message] = {}
+
+        for entry in queued_messages:
+            channel_id = entry.message.channel.id
+            queued_ids_by_channel.setdefault(channel_id, set()).add(entry.message.id)
+            representative_messages.setdefault(channel_id, entry.message)
+
+        channel_blocks: list[str] = []
+        for channel_id, representative_message in representative_messages.items():
+            lines = await self._fetch_batch_context_lines(
+                representative_message,
+                exclude_message_ids=queued_ids_by_channel[channel_id],
+            )
+            if not lines:
+                continue
+            channel_blocks.append(
+                f"{self._format_batch_channel_label(representative_message)}\n"
+                + "\n".join(lines)
+            )
+
+        return "\n\n".join(channel_blocks)
+
+    async def _fetch_batch_context_lines(
+        self,
+        message: discord.Message,
+        *,
+        exclude_message_ids: set[int],
+    ) -> list[str]:
+        lines: list[str] = []
+        try:
+            async for history_message in message.channel.history(
+                limit=BATCH_CONTEXT_HISTORY_FETCH_LIMIT
+            ):
+                if history_message.author.bot:
+                    continue
+                if history_message.id in exclude_message_ids:
+                    continue
+
+                content = self._prepare_message_content(history_message)
+                if not self._content_has_substance(content):
+                    continue
+
+                lines.append(
+                    self._format_batch_context_line(
+                        history_message,
+                        content=content,
+                    )
+                )
+                if len(lines) >= BATCH_CONTEXT_MAX_USER_MESSAGES:
+                    break
+        except (
+            AttributeError,
+            discord.Forbidden,
+            discord.HTTPException,
+            discord.NotFound,
+        ):
+            return []
+
+        lines.reverse()
+        return lines
 
     def _queued_messages_are_similar(
         self,
@@ -1185,6 +1261,20 @@ class ReaderBot(commands.Bot):
             return "#unknown"
         return self._format_scope_label(guild, message.channel.id)
 
+    def _format_batch_timestamp(self, created_at: datetime) -> str:
+        return created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+    def _format_batch_context_line(
+        self,
+        message: discord.Message,
+        *,
+        content: str,
+    ) -> str:
+        return (
+            f"{self._format_batch_timestamp(message.created_at)} | "
+            f"{self._display_name_for_batch_model(message.author)}: {content}"
+        )
+
     async def _maybe_add_loader_reaction(self, message: discord.Message) -> bool:
         emoji = discord.PartialEmoji.from_str(LOADER_EMOJI)
         try:
@@ -1242,6 +1332,13 @@ class ReaderBot(commands.Bot):
             return name.strip()
 
         return "Unknown user"
+
+    def _display_name_for_batch_model(self, user: discord.abc.User) -> str:
+        display_name = self._display_name_for_user(user)
+        user_id = getattr(user, "id", None)
+        if isinstance(user_id, int) and self._user_is_owner(user_id):
+            return f"{display_name} [MAINTAINER]"
+        return display_name
 
     async def _tree_interaction_check(self, interaction: discord.Interaction[Any]) -> bool:
         ban = await self._get_user_ban(interaction.user.id)

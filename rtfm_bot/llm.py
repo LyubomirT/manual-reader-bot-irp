@@ -39,6 +39,7 @@ class BatchClassifierMessage:
     author_display_name: str
     content: str
     channel_label: str
+    created_at_label: str
     is_bot: bool
 
 
@@ -77,13 +78,18 @@ class PollinationsClient:
     async def classify_docs_candidates(
         self,
         messages: list[BatchClassifierMessage],
+        *,
+        conversation_prefix: str = "",
     ) -> list[str]:
         if not messages:
             return []
 
         payload = await self._request_chat_completion(
             model=self._config.pollinations_batch_model,
-            messages=self._build_batch_classifier_messages(messages),
+            messages=self._build_batch_classifier_messages(
+                messages,
+                conversation_prefix=conversation_prefix,
+            ),
             temperature=0.0,
             max_tokens=180,
             response_format={"type": "text"},
@@ -213,21 +219,35 @@ class PollinationsClient:
     def _build_batch_classifier_messages(
         self,
         messages: list[BatchClassifierMessage],
+        *,
+        conversation_prefix: str = "",
     ) -> list[dict[str, str]]:
         transcript_lines = []
         for entry in messages:
             actor_kind = "bot-context" if entry.is_bot else "human"
             transcript_lines.append(
                 f"{entry.batch_id} | {actor_kind} | {entry.channel_label} | "
+                f"{entry.created_at_label} | "
                 f"{entry.author_display_name}: {entry.content}"
             )
+
+        sections: list[str] = []
+        if conversation_prefix.strip():
+            sections.append("RECENT_CHANNEL_CONTEXT\n\n" + conversation_prefix.strip())
+        sections.append("QUEUED_MESSAGES\n\n" + "\n".join(transcript_lines))
 
         return [
             {
                 "role": "system",
                 "content": (
                     "You triage Discord messages for Reader of the Manual. "
-                    "Return only a comma-separated list of HUMAN message IDs that are directly asking about IntenseRP Next docs, setup, migration, or how the software works. "
+                    "Decide which queued HUMAN messages genuinely need a docs-helper reply right now. "
+                    "Use RECENT_CHANNEL_CONTEXT only as background, and return IDs only from QUEUED_MESSAGES. "
+                    "Return only a comma-separated list of HUMAN message IDs that are directly asking for help about IntenseRP Next docs, setup, migration, features, behavior, or how the software works. "
+                    "A message qualifies only when the human is clearly asking for help, clarification, instructions, steps, migration guidance, or an explanation. "
+                    "If it is only a statement, status update, joke, reaction, opinion, praise, complaint, or a casual mention of IRP/docs without asking for help, do not return it. "
+                    "If a message is ambiguous, lean toward skipping it. "
+                    "Use timestamps and nearby context to tell whether the message is a fresh help request or just commentary. "
                     "Treat IRP, Intense RP, and IntenseRP Next as aliases for IntenseRP Next. "
                     "Treat IntenseRP API as a different older project unless the user is explicitly asking about migration or differences. "
                     "Do not return advanced troubleshooting, log analysis, crash debugging, generic tech chat, casual chatting, or vague reactions. "
@@ -238,7 +258,7 @@ class PollinationsClient:
             },
             {
                 "role": "user",
-                "content": "RECENT_MESSAGES\n\n" + "\n".join(transcript_lines),
+                "content": "\n\n".join(sections),
             },
         ]
 
