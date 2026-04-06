@@ -33,6 +33,22 @@ def _read_positive_int(name: str, default: int) -> int:
     return value
 
 
+def _read_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    normalized = raw_value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Environment variable {name} must be a boolean value like true/false."
+    )
+
+
 @dataclass(slots=True)
 class BotConfig:
     discord_bot_token: str
@@ -55,6 +71,7 @@ class BotConfig:
     global_rate_limit_window_seconds: int
     conversation_max_messages: int
     conversation_inactivity_seconds: int
+    auto_reply_enabled: bool
     auto_reply_batch_interval_seconds: int
     cache_refresh_interval_seconds: int
     status_rotation_interval_seconds: int
@@ -121,6 +138,7 @@ class BotConfig:
             global_rate_limit_window_seconds=_read_int("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", 3600),
             conversation_max_messages=_read_int("CONVERSATION_MAX_MESSAGES", 10),
             conversation_inactivity_seconds=_read_int("CONVERSATION_INACTIVITY_SECONDS", 3600),
+            auto_reply_enabled=_read_bool("AUTO_REPLY_ENABLED", False),
             auto_reply_batch_interval_seconds=_read_positive_int(
                 "AUTO_REPLY_BATCH_INTERVAL_SECONDS",
                 30,

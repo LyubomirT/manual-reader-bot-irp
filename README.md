@@ -6,7 +6,7 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 
 - Mention/reply driven chat in public channels
 - Per-user model preferences with a reply button picker and `/model`
-- Batched auto-triage every 30 seconds for likely docs/setup questions in normal chat
+- Optional batched auto-triage every 30 seconds for likely docs/setup questions in normal chat
 - Slash commands for `/help`, `/model`, `/rate_limit_status`, `/update_cache`, and `/clear_memory`
 - Admin memory inspection via `/inspect_channel_memory` and `/inspect_memory_global`
 - Admin user blocking via `/ban_user` and `/unban_user`
@@ -60,6 +60,7 @@ The main options live in `.env.example`. The important ones are:
 - `ALLOWED_GUILD_ID`
 - `ALLOWED_ROLE_ID`
 - `BOT_OWNER_USER_ID`
+- `AUTO_REPLY_ENABLED`
 - `STATUS_ROTATION_INTERVAL_SECONDS`
 - `AUTO_REPLY_BATCH_INTERVAL_SECONDS`
 - rate limit settings
@@ -85,7 +86,7 @@ The main options live in `.env.example`. The important ones are:
 - Blocked users cannot chat with the bot or use any slash commands.
 - DMs are rejected.
 - AI replies include a small model/status view with a model-picker button.
-- The bot can proactively answer likely docs/setup questions it spots in public chat after batched triage.
+- The bot can proactively answer likely docs/setup questions it spots in public chat after batched triage when `AUTO_REPLY_ENABLED=true`.
 - Replies are plain text; system slash command responses use embeds.
 - Docs retrieval now uses a model-assisted page selector over the full cached docs corpus.
 - The LLM is instructed not to reveal reasoning traces.

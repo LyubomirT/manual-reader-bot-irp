@@ -534,10 +534,13 @@ class ReaderBot(commands.Bot):
             self._cache_refresh_loop(),
             name="docs-cache-refresh-loop",
         )
-        self._batch_queue_task = asyncio.create_task(
-            self._batch_queue_loop(),
-            name="batch-docs-triage-loop",
-        )
+        if self.config.auto_reply_enabled:
+            self._batch_queue_task = asyncio.create_task(
+                self._batch_queue_loop(),
+                name="batch-docs-triage-loop",
+            )
+        else:
+            LOGGER.info("Automatic replies are disabled; skipping batched docs triage loop.")
         self._status_rotation_task = asyncio.create_task(
             self._status_rotation_loop(),
             name="bot-status-rotation-loop",
@@ -585,8 +588,8 @@ class ReaderBot(commands.Bot):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             if (
-                message.guild is not None
-                and message.guild.id == self.config.allowed_guild_id
+                self.config.auto_reply_enabled
+                and self._message_is_batch_eligible(message)
                 and (self.user is None or message.author.id != self.user.id)
             ):
                 content = self._prepare_message_content(message)
@@ -610,7 +613,8 @@ class ReaderBot(commands.Bot):
         targets_bot = await self._message_targets_bot(message)
         if not targets_bot:
             if (
-                self._member_has_allowed_role(message.author)
+                self.config.auto_reply_enabled
+                and self._member_has_allowed_role(message.author)
                 and await self._get_user_ban(message.author.id) is None
             ):
                 content = self._prepare_message_content(message)
@@ -660,6 +664,12 @@ class ReaderBot(commands.Bot):
             ],
             target_users=[],
             auto_reply=False,
+        )
+
+    def _message_is_batch_eligible(self, message: discord.Message) -> bool:
+        return (
+            message.guild is not None
+            and message.guild.id == self.config.allowed_guild_id
         )
 
     async def _generate_reply(self, request: ChatRequest) -> str:
