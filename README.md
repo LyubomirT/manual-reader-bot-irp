@@ -2,6 +2,9 @@
 
 Discord bot for the IntenseRP Next server. It answers docs questions when users mention or reply to it, keeps a short per-channel/thread memory in SQLite, and refreshes a local docs cache from the Read the Docs search index.
 
+> [!NOTE]
+> This is not meant to be a serious, general-purpose project. It's mostly centered around my other project [IntenseRP Next](https://github.com/LyubomirT/intense-rp-next) and is intentionally built with a lot of quick-and-dirty solutions, hardcoded assumptions, and hacky workarounds. Right now it's used in a single server (the official IntenseRP Next server) and is not designed for reuse or extensibility. That said, it does have a lot of features and is a fun example of a small, self-contained LLM-powered bot with some interesting implementation details.
+
 ## Features
 
 - Mention/reply driven chat in public channels
