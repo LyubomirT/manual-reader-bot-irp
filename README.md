@@ -5,6 +5,9 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 > [!NOTE]
 > This is not meant to be a serious, general-purpose project. It's mostly centered around my other project [IntenseRP Next](https://github.com/LyubomirT/intense-rp-next) and is intentionally built with a lot of quick-and-dirty solutions, hardcoded assumptions, and hacky workarounds. Right now it's used in a single server (the official IntenseRP Next server) and is not designed for reuse or extensibility. That said, it does have a lot of features and is a fun example of a small, self-contained LLM-powered bot with some interesting implementation details.
 
+> [!IMPORTANT]
+> Huge thanks to [Pollinations.ai](https://pollinations.ai) for making it possible to have a powerful LLM backend without worrying about hosting, scaling, or severe API costs. The bot is built around the Pollinations API and wouldn't be feasible to run on something like OpenAI's API without significant optimizations and cost management.
+
 ## Features
 
 - Mention/reply driven chat in public channels
