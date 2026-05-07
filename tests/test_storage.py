@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -73,7 +74,7 @@ class ConversationStoreTests(unittest.TestCase):
         )
 
         stale_time = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection:
             connection.execute(
                 "UPDATE conversation_scopes SET last_activity_at = ? WHERE scope_id = ?",
                 (stale_time, 202),

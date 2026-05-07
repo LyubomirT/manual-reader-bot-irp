@@ -24,28 +24,39 @@ class BotConfigTests(unittest.TestCase):
         module.load_dotenv = lambda: None
         return patch.dict(sys.modules, {"dotenv": module})
 
-    def test_auto_reply_enabled_defaults_to_false(self) -> None:
+    def test_ai_triggered_bans_default_to_false(self) -> None:
         with patch.dict(os.environ, self._base_env(), clear=True), self._mock_dotenv():
             config = BotConfig.from_env()
 
-        self.assertFalse(config.auto_reply_enabled)
+        self.assertFalse(config.ai_triggered_bans_enabled)
 
-    def test_auto_reply_enabled_accepts_true(self) -> None:
+    def test_ai_triggered_bans_accept_true(self) -> None:
         env = self._base_env()
-        env["AUTO_REPLY_ENABLED"] = "true"
+        env["AI_TRIGGERED_BANS_ENABLED"] = "true"
 
         with patch.dict(os.environ, env, clear=True), self._mock_dotenv():
             config = BotConfig.from_env()
 
-        self.assertTrue(config.auto_reply_enabled)
+        self.assertTrue(config.ai_triggered_bans_enabled)
 
-    def test_auto_reply_enabled_rejects_invalid_values(self) -> None:
+    def test_ai_triggered_bans_reject_invalid_values(self) -> None:
         env = self._base_env()
-        env["AUTO_REPLY_ENABLED"] = "maybe"
+        env["AI_TRIGGERED_BANS_ENABLED"] = "maybe"
 
         with patch.dict(os.environ, env, clear=True), self._mock_dotenv():
             with self.assertRaises(ValueError):
                 BotConfig.from_env()
+
+    def test_status_phrases_file_is_optional_path(self) -> None:
+        env = self._base_env()
+        env["STATUS_PHRASES_FILE"] = "statuses.txt"
+
+        with patch.dict(os.environ, env, clear=True), self._mock_dotenv():
+            config = BotConfig.from_env()
+
+        self.assertIsNotNone(config.status_phrases_file)
+        assert config.status_phrases_file is not None
+        self.assertEqual(config.status_phrases_file.name, "statuses.txt")
 
 
 if __name__ == "__main__":

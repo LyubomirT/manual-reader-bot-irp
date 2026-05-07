@@ -55,12 +55,12 @@ class BotConfig:
     pollinations_api_key: str
     pollinations_model: str
     pollinations_selector_model: str
-    pollinations_batch_model: str
     pollinations_base_url: str
     command_guild_id: int | None
     allowed_guild_id: int
     allowed_role_id: int
     owner_user_id: int
+    ai_triggered_bans_enabled: bool
     docs_base_url: str
     docs_search_index_url: str
     docs_search_index_file: Path | None
@@ -71,10 +71,9 @@ class BotConfig:
     global_rate_limit_window_seconds: int
     conversation_max_messages: int
     conversation_inactivity_seconds: int
-    auto_reply_enabled: bool
-    auto_reply_batch_interval_seconds: int
     cache_refresh_interval_seconds: int
     status_rotation_interval_seconds: int
+    status_phrases_file: Path | None
     docs_fetch_concurrency: int
     docs_selector_page_limit: int
     http_timeout_seconds: int
@@ -104,9 +103,6 @@ class BotConfig:
             pollinations_selector_model=(
                 os.getenv("POLLINATIONS_SELECTOR_MODEL", "openai").strip() or "openai"
             ),
-            pollinations_batch_model=(
-                os.getenv("POLLINATIONS_BATCH_MODEL", "gemini-fast").strip() or "gemini-fast"
-            ),
             pollinations_base_url=(
                 os.getenv("POLLINATIONS_BASE_URL", "https://gen.pollinations.ai/v1").rstrip("/")
             ),
@@ -114,6 +110,7 @@ class BotConfig:
             allowed_guild_id=_read_int("ALLOWED_GUILD_ID", 1480820197236674714),
             allowed_role_id=_read_int("ALLOWED_ROLE_ID", 1480853263745155162),
             owner_user_id=_read_int("BOT_OWNER_USER_ID", 861620168370683924),
+            ai_triggered_bans_enabled=_read_bool("AI_TRIGGERED_BANS_ENABLED", False),
             docs_base_url=os.getenv(
                 "DOCS_BASE_URL",
                 "https://intense-rp-next.readthedocs.io/en/latest/",
@@ -138,15 +135,15 @@ class BotConfig:
             global_rate_limit_window_seconds=_read_int("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", 3600),
             conversation_max_messages=_read_int("CONVERSATION_MAX_MESSAGES", 10),
             conversation_inactivity_seconds=_read_int("CONVERSATION_INACTIVITY_SECONDS", 3600),
-            auto_reply_enabled=_read_bool("AUTO_REPLY_ENABLED", False),
-            auto_reply_batch_interval_seconds=_read_positive_int(
-                "AUTO_REPLY_BATCH_INTERVAL_SECONDS",
-                30,
-            ),
             cache_refresh_interval_seconds=_read_int("CACHE_REFRESH_INTERVAL_SECONDS", 21600),
             status_rotation_interval_seconds=_read_positive_int(
                 "STATUS_ROTATION_INTERVAL_SECONDS",
                 3600,
+            ),
+            status_phrases_file=(
+                Path(path_value).resolve()
+                if (path_value := os.getenv("STATUS_PHRASES_FILE", "").strip())
+                else None
             ),
             docs_fetch_concurrency=_read_int("DOCS_FETCH_CONCURRENCY", 5),
             docs_selector_page_limit=_read_int("DOCS_SELECTOR_PAGE_LIMIT", 4),

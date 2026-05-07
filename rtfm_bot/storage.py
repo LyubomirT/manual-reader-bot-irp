@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -117,10 +118,6 @@ class ConversationStore:
         async with self._lock:
             return await asyncio.to_thread(self._get_user_ban_sync, user_id)
 
-    async def is_user_banned(self, *, user_id: int) -> bool:
-        async with self._lock:
-            return await asyncio.to_thread(self._is_user_banned_sync, user_id)
-
     async def ban_user(
         self,
         *,
@@ -160,7 +157,7 @@ class ConversationStore:
             )
 
     def _initialize_sync(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 """
@@ -235,7 +232,7 @@ class ConversationStore:
     ) -> list[ConversationMessage]:
         now = datetime.now(UTC)
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             self._purge_scope_if_inactive_sync(
                 connection,
                 scope_id=scope_id,
@@ -280,7 +277,7 @@ class ConversationStore:
         now = datetime.now(UTC)
         now_iso = now.isoformat()
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             self._purge_scope_if_inactive_sync(
                 connection,
                 scope_id=scope_id,
@@ -336,7 +333,7 @@ class ConversationStore:
     ) -> list[ConversationScopeSummary]:
         now = datetime.now(UTC)
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             self._purge_inactive_scopes_sync(
                 connection,
                 guild_id=guild_id,
@@ -380,7 +377,7 @@ class ConversationStore:
         ]
 
     def _clear_scope_sync(self, scope_id: int) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 "DELETE FROM conversation_messages WHERE scope_id = ?",
                 (scope_id,),
@@ -392,7 +389,7 @@ class ConversationStore:
             connection.commit()
 
     def _get_user_ban_sync(self, user_id: int) -> UserBan | None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             row = connection.execute(
                 """
                 SELECT user_id, source, banned_at, banned_by_user_id, banned_by_name
@@ -414,7 +411,7 @@ class ConversationStore:
         )
 
     def _is_user_banned_sync(self, user_id: int) -> bool:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             row = connection.execute(
                 """
                 SELECT 1
@@ -436,7 +433,7 @@ class ConversationStore:
         banned_at = datetime.now(UTC)
         banned_at_iso = banned_at.isoformat()
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO user_bans (
@@ -472,7 +469,7 @@ class ConversationStore:
         )
 
     def _unban_user_sync(self, user_id: int) -> bool:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM user_bans
@@ -485,7 +482,7 @@ class ConversationStore:
         return cursor.rowcount > 0
 
     def _get_user_model_preference_sync(self, user_id: int) -> UserModelPreference | None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             row = connection.execute(
                 """
                 SELECT user_id, model_id, updated_at
@@ -512,7 +509,7 @@ class ConversationStore:
         updated_at = datetime.now(UTC)
         updated_at_iso = updated_at.isoformat()
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO user_model_preferences (

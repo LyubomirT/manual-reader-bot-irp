@@ -4,9 +4,6 @@ import asyncio
 import logging
 import random
 import re
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from difflib import SequenceMatcher
 from typing import Any
 
 import aiohttp
@@ -17,7 +14,6 @@ from discord.ext import commands
 from rtfm_bot.config import BotConfig
 from rtfm_bot.docs_cache import DocsCacheManager, RefreshResult
 from rtfm_bot.llm import (
-    BatchClassifierMessage,
     ChatRequest,
     PollinationsClient,
     PollinationsError,
@@ -33,7 +29,12 @@ from rtfm_bot.storage import (
     ConversationStore,
     UserBan,
 )
-from rtfm_bot.statuses import BotStatusSpec, DEFAULT_ROTATING_STATUSES, choose_next_status
+from rtfm_bot.statuses import (
+    BotStatusSpec,
+    DEFAULT_ROTATING_STATUSES,
+    choose_next_status,
+    load_statuses_from_file,
+)
 
 LOGGER = logging.getLogger(__name__)
 MAX_MEMORY_SCOPE_OPTIONS = 25
@@ -41,31 +42,12 @@ MEMORY_VIEW_TIMEOUT_SECONDS = 300
 MODEL_RESPONSE_VIEW_TIMEOUT_SECONDS = 1800
 INITIAL_STATUS_UPDATE_DELAY_SECONDS = 5
 LOADER_EMOJI = "<a:loader:1488104843108290570>"
-BATCH_QUEUE_MAX_MESSAGES = 250
-BATCH_CONTEXT_MAX_USER_MESSAGES = 15
-BATCH_CONTEXT_HISTORY_FETCH_LIMIT = 100
-AUTO_REPLY_SIMILARITY_THRESHOLD = 0.72
 AI_BAN_BLOCK_MESSAGE = "You're blocked from using Reader of the Manual now."
 AI_BAN_NOTICE_MESSAGE = (
     "The AI blocked you for suspected abuse, weird messaging, or wasting the owner's tokens. "
     "Only the bot owner can undo an AI block."
 )
 GENERIC_BANNED_MESSAGE = "You're blocked from using Reader of the Manual."
-
-
-@dataclass(slots=True)
-class PendingStoredMessage:
-    author_id: int | None
-    author_name: str | None
-    content: str
-
-
-@dataclass(slots=True)
-class QueuedBatchMessage:
-    message: discord.Message
-    content: str
-    author_display_name: str
-    candidate: bool
 
 
 def _truncate_text(value: str | None, limit: int) -> str:
@@ -498,12 +480,10 @@ class ReaderBot(commands.Bot):
             window_seconds=config.global_rate_limit_window_seconds,
         )
         self._cache_refresh_task: asyncio.Task[None] | None = None
-        self._batch_queue_task: asyncio.Task[None] | None = None
         self._status_rotation_task: asyncio.Task[None] | None = None
         self._status_random = random.Random()
         self._current_status: BotStatusSpec | None = None
-        self._batch_queue: list[QueuedBatchMessage] = []
-        self._batch_queue_lock = asyncio.Lock()
+        self._rotating_statuses = self._load_rotating_statuses()
         self._conversation_storage_limit = max(
             model_spec.scaled_history_limit(config.conversation_max_messages)
             for model_spec in iter_model_specs()
@@ -534,13 +514,6 @@ class ReaderBot(commands.Bot):
             self._cache_refresh_loop(),
             name="docs-cache-refresh-loop",
         )
-        if self.config.auto_reply_enabled:
-            self._batch_queue_task = asyncio.create_task(
-                self._batch_queue_loop(),
-                name="batch-docs-triage-loop",
-            )
-        else:
-            LOGGER.info("Automatic replies are disabled; skipping batched docs triage loop.")
         self._status_rotation_task = asyncio.create_task(
             self._status_rotation_loop(),
             name="bot-status-rotation-loop",
@@ -562,12 +535,6 @@ class ReaderBot(commands.Bot):
                 await self._cache_refresh_task
             except asyncio.CancelledError:
                 pass
-        if self._batch_queue_task is not None:
-            self._batch_queue_task.cancel()
-            try:
-                await self._batch_queue_task
-            except asyncio.CancelledError:
-                pass
         if self._status_rotation_task is not None:
             self._status_rotation_task.cancel()
             try:
@@ -587,18 +554,6 @@ class ReaderBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
-            if (
-                self.config.auto_reply_enabled
-                and self._message_is_batch_eligible(message)
-                and (self.user is None or message.author.id != self.user.id)
-            ):
-                content = self._prepare_message_content(message)
-                if self._content_has_substance(content):
-                    await self._enqueue_batch_message(
-                        message,
-                        content=content,
-                        candidate=False,
-                    )
             return
 
         if message.guild is None:
@@ -612,18 +567,6 @@ class ReaderBot(commands.Bot):
 
         targets_bot = await self._message_targets_bot(message)
         if not targets_bot:
-            if (
-                self.config.auto_reply_enabled
-                and self._member_has_allowed_role(message.author)
-                and await self._get_user_ban(message.author.id) is None
-            ):
-                content = self._prepare_message_content(message)
-                if self._content_has_substance(content):
-                    await self._enqueue_batch_message(
-                        message,
-                        content=content,
-                        candidate=True,
-                    )
             return
 
         if await self._handle_banned_message(message):
@@ -655,21 +598,6 @@ class ReaderBot(commands.Bot):
             message,
             content=content,
             model_spec=model_spec,
-            stored_messages=[
-                PendingStoredMessage(
-                    author_id=message.author.id,
-                    author_name=message.author.display_name,
-                    content=content,
-                )
-            ],
-            target_users=[],
-            auto_reply=False,
-        )
-
-    def _message_is_batch_eligible(self, message: discord.Message) -> bool:
-        return (
-            message.guild is not None
-            and message.guild.id == self.config.allowed_guild_id
         )
 
     async def _generate_reply(self, request: ChatRequest) -> str:
@@ -689,29 +617,24 @@ class ReaderBot(commands.Bot):
         *,
         content: str,
         model_spec: ModelSpec,
-        stored_messages: list[PendingStoredMessage],
-        target_users: list[discord.abc.User],
-        auto_reply: bool,
     ) -> bool:
         if message.guild is None or message.channel.id is None:
             return False
 
         channel_status = self._channel_rate_status_for_model(message.channel.id, model_spec)
         if channel_status.retry_after:
-            if not auto_reply:
-                await message.reply(
-                    f"This channel is on cooldown for {channel_status.retry_after}s. Try me again in a minute.",
-                    mention_author=False,
-                )
+            await message.reply(
+                f"This channel is on cooldown for {channel_status.retry_after}s. Try me again in a minute.",
+                mention_author=False,
+            )
             return False
 
         global_status = self._global_rate_status_for_model(model_spec)
         if global_status.retry_after:
-            if not auto_reply:
-                await message.reply(
-                    f"I'm rate limited right now. Give me about {global_status.retry_after}s to chill.",
-                    mention_author=False,
-                )
+            await message.reply(
+                f"I'm rate limited right now. Give me about {global_status.retry_after}s to chill.",
+                mention_author=False,
+            )
             return False
 
         self.channel_rate_limiter.hit(message.channel.id)
@@ -725,11 +648,6 @@ class ReaderBot(commands.Bot):
             limit=history_limit,
             inactivity_seconds=self.config.conversation_inactivity_seconds,
         )
-        audience_names = [
-            self._display_name_for_user(user)
-            for user in target_users
-            if user.id != message.author.id
-        ]
         request = ChatRequest(
             question=content,
             user_display_name=message.author.display_name,
@@ -738,8 +656,6 @@ class ReaderBot(commands.Bot):
             docs_available=self.docs_cache.available,
             model_id=model_spec.id,
             docs_page_limit=docs_page_limit,
-            is_auto_reply=auto_reply,
-            audience_names=audience_names,
         )
 
         loader_added = await self._maybe_add_loader_reaction(message)
@@ -748,58 +664,60 @@ class ReaderBot(commands.Bot):
                 response_text = await self._generate_reply(request)
         except PollinationsError as exc:
             LOGGER.exception("Pollinations request failed.")
-            if not auto_reply:
-                await message.reply(
-                    f"I tripped over the AI request just now: {exc}",
-                    mention_author=False,
-                )
+            await message.reply(
+                f"I tripped over the AI request just now: {exc}",
+                mention_author=False,
+            )
             return False
         except Exception:
             LOGGER.exception("Unexpected error while generating a reply.")
-            if not auto_reply:
-                await message.reply(
-                    "Something broke while I was digging through the manual. Please try again in a bit.",
-                    mention_author=False,
-                )
+            await message.reply(
+                "Something broke while I was digging through the manual. Please try again in a bit.",
+                mention_author=False,
+            )
             return False
         finally:
             if loader_added:
                 await self._maybe_remove_loader_reaction(message)
 
-        if is_ban_user_signal(response_text):
+        if is_ban_user_signal(response_text) and self.config.ai_triggered_bans_enabled:
             try:
                 await self._apply_ai_ban(message)
             except Exception:
                 LOGGER.exception("Failed to apply an AI-triggered ban.")
-                if not auto_reply:
-                    await message.reply(
-                        "I tripped over the moderation bit just now. Please poke the bot owner.",
-                        mention_author=False,
-                    )
+                await message.reply(
+                    "I tripped over the moderation bit just now. Please poke the bot owner.",
+                    mention_author=False,
+                )
             return False
+        if is_ban_user_signal(response_text):
+            LOGGER.warning(
+                "Suppressed AI-triggered ban signal because AI bans are disabled."
+            )
+            response_text = (
+                "I don't have a useful answer for that one. Try asking a clearer docs question."
+            )
 
         try:
             await self._send_reply(
                 message,
                 response_text,
                 model_spec=model_spec,
-                target_users=target_users if len(target_users) > 1 else [],
             )
         except discord.HTTPException:
             LOGGER.exception("Failed to send the generated reply.")
             return False
 
-        for stored_message in stored_messages:
-            await self.store.append_message(
-                scope_id=message.channel.id,
-                guild_id=message.guild.id,
-                role="user",
-                content=stored_message.content,
-                author_id=stored_message.author_id,
-                author_name=stored_message.author_name,
-                max_messages=self._conversation_storage_limit,
-                inactivity_seconds=self.config.conversation_inactivity_seconds,
-            )
+        await self.store.append_message(
+            scope_id=message.channel.id,
+            guild_id=message.guild.id,
+            role="user",
+            content=content,
+            author_id=message.author.id,
+            author_name=message.author.display_name,
+            max_messages=self._conversation_storage_limit,
+            inactivity_seconds=self.config.conversation_inactivity_seconds,
+        )
         await self.store.append_message(
             scope_id=message.channel.id,
             guild_id=message.guild.id,
@@ -811,229 +729,6 @@ class ReaderBot(commands.Bot):
             inactivity_seconds=self.config.conversation_inactivity_seconds,
         )
         return True
-
-    async def _batch_queue_loop(self) -> None:
-        await self.wait_until_ready()
-        while True:
-            try:
-                await asyncio.sleep(self.config.auto_reply_batch_interval_seconds)
-                await self._process_batch_queue()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOGGER.exception("Unexpected error in the batched docs triage loop.")
-
-    async def _enqueue_batch_message(
-        self,
-        message: discord.Message,
-        *,
-        content: str,
-        candidate: bool,
-    ) -> None:
-        entry = QueuedBatchMessage(
-            message=message,
-            content=content,
-            author_display_name=self._display_name_for_batch_model(message.author),
-            candidate=candidate,
-        )
-        async with self._batch_queue_lock:
-            self._batch_queue.append(entry)
-            if len(self._batch_queue) > BATCH_QUEUE_MAX_MESSAGES:
-                self._batch_queue = self._batch_queue[-BATCH_QUEUE_MAX_MESSAGES:]
-
-    async def _process_batch_queue(self) -> None:
-        async with self._batch_queue_lock:
-            if not self._batch_queue:
-                return
-            queued_messages = list(self._batch_queue)
-            self._batch_queue.clear()
-
-        if self.llm is None:
-            return
-        if not any(entry.candidate for entry in queued_messages):
-            return
-
-        classifier_messages: list[BatchClassifierMessage] = []
-        entry_by_batch_id: dict[str, QueuedBatchMessage] = {}
-        for index, entry in enumerate(queued_messages, start=1):
-            batch_id = f"M{index:02d}"
-            classifier_messages.append(
-                BatchClassifierMessage(
-                    batch_id=batch_id,
-                    author_display_name=entry.author_display_name,
-                    content=entry.content,
-                    channel_label=self._format_batch_channel_label(entry.message),
-                    created_at_label=self._format_batch_timestamp(entry.message.created_at),
-                    is_bot=not entry.candidate,
-                )
-            )
-            entry_by_batch_id[batch_id] = entry
-
-        conversation_prefix = await self._build_batch_classifier_context_prefix(
-            queued_messages
-        )
-        try:
-            selected_ids = await self.llm.classify_docs_candidates(
-                classifier_messages,
-                conversation_prefix=conversation_prefix,
-            )
-        except PollinationsError:
-            LOGGER.exception("Batched docs classifier failed.")
-            return
-
-        selected_entries = [
-            entry_by_batch_id[batch_id]
-            for batch_id in selected_ids
-            if batch_id in entry_by_batch_id and entry_by_batch_id[batch_id].candidate
-        ]
-        if not selected_entries:
-            return
-
-        for cluster in self._cluster_batch_entries(selected_entries):
-            latest_entry = cluster[-1]
-            model_spec = await self._get_user_model_spec(latest_entry.message.author.id)
-            target_users: list[discord.abc.User] = []
-            seen_user_ids: set[int] = set()
-            for entry in cluster:
-                if entry.message.author.id in seen_user_ids:
-                    continue
-                seen_user_ids.add(entry.message.author.id)
-                target_users.append(entry.message.author)
-
-            await self._handle_ai_request(
-                latest_entry.message,
-                content=latest_entry.content,
-                model_spec=model_spec,
-                stored_messages=[
-                    PendingStoredMessage(
-                        author_id=entry.message.author.id,
-                        author_name=entry.author_display_name,
-                        content=entry.content,
-                    )
-                    for entry in cluster
-                ],
-                target_users=target_users,
-                auto_reply=True,
-            )
-
-    def _cluster_batch_entries(
-        self,
-        entries: list[QueuedBatchMessage],
-    ) -> list[list[QueuedBatchMessage]]:
-        remaining = sorted(entries, key=lambda entry: entry.message.created_at)
-        clusters: list[list[QueuedBatchMessage]] = []
-
-        while remaining:
-            anchor = remaining.pop()
-            cluster = [anchor]
-            unmatched: list[QueuedBatchMessage] = []
-            for candidate in remaining:
-                if self._queued_messages_are_similar(candidate, anchor):
-                    cluster.append(candidate)
-                else:
-                    unmatched.append(candidate)
-            remaining = unmatched
-            clusters.append(sorted(cluster, key=lambda entry: entry.message.created_at))
-
-        clusters.reverse()
-        return clusters
-
-    async def _build_batch_classifier_context_prefix(
-        self,
-        queued_messages: list[QueuedBatchMessage],
-    ) -> str:
-        queued_ids_by_channel: dict[int, set[int]] = {}
-        representative_messages: dict[int, discord.Message] = {}
-
-        for entry in queued_messages:
-            channel_id = entry.message.channel.id
-            queued_ids_by_channel.setdefault(channel_id, set()).add(entry.message.id)
-            representative_messages.setdefault(channel_id, entry.message)
-
-        channel_blocks: list[str] = []
-        for channel_id, representative_message in representative_messages.items():
-            lines = await self._fetch_batch_context_lines(
-                representative_message,
-                exclude_message_ids=queued_ids_by_channel[channel_id],
-            )
-            if not lines:
-                continue
-            channel_blocks.append(
-                f"{self._format_batch_channel_label(representative_message)}\n"
-                + "\n".join(lines)
-            )
-
-        return "\n\n".join(channel_blocks)
-
-    async def _fetch_batch_context_lines(
-        self,
-        message: discord.Message,
-        *,
-        exclude_message_ids: set[int],
-    ) -> list[str]:
-        lines: list[str] = []
-        try:
-            async for history_message in message.channel.history(
-                limit=BATCH_CONTEXT_HISTORY_FETCH_LIMIT
-            ):
-                if history_message.author.bot:
-                    continue
-                if history_message.id in exclude_message_ids:
-                    continue
-
-                content = self._prepare_message_content(history_message)
-                if not self._content_has_substance(content):
-                    continue
-
-                lines.append(
-                    self._format_batch_context_line(
-                        history_message,
-                        content=content,
-                    )
-                )
-                if len(lines) >= BATCH_CONTEXT_MAX_USER_MESSAGES:
-                    break
-        except (
-            AttributeError,
-            discord.Forbidden,
-            discord.HTTPException,
-            discord.NotFound,
-        ):
-            return []
-
-        lines.reverse()
-        return lines
-
-    def _queued_messages_are_similar(
-        self,
-        first: QueuedBatchMessage,
-        second: QueuedBatchMessage,
-    ) -> bool:
-        if first.message.channel.id != second.message.channel.id:
-            return False
-
-        first_text = self._normalize_similarity_text(first.content)
-        second_text = self._normalize_similarity_text(second.content)
-        if not first_text or not second_text:
-            return False
-
-        first_tokens = set(re.findall(r"[a-z0-9]+", first_text))
-        second_tokens = set(re.findall(r"[a-z0-9]+", second_text))
-        token_overlap = 0.0
-        if first_tokens and second_tokens:
-            token_overlap = len(first_tokens & second_tokens) / max(
-                1,
-                min(len(first_tokens), len(second_tokens)),
-            )
-
-        sequence_score = SequenceMatcher(None, first_text, second_text).ratio()
-        return max(token_overlap, sequence_score) >= AUTO_REPLY_SIMILARITY_THRESHOLD
-
-    def _normalize_similarity_text(self, content: str) -> str:
-        tokens = tokenize(content)
-        if tokens:
-            return " ".join(tokens)
-        return re.sub(r"\s+", " ", content.casefold()).strip()
 
     async def _cache_refresh_loop(self) -> None:
         while True:
@@ -1055,6 +750,27 @@ class ReaderBot(commands.Bot):
                 raise
             except Exception:
                 LOGGER.exception("Unexpected error in docs cache refresh loop.")
+
+    def _load_rotating_statuses(self) -> tuple[BotStatusSpec, ...]:
+        path = self.config.status_phrases_file
+        if path is None:
+            return DEFAULT_ROTATING_STATUSES
+
+        try:
+            statuses = load_statuses_from_file(path)
+        except OSError as exc:
+            LOGGER.warning("Failed to load status phrases from %s: %s", path, exc)
+            return DEFAULT_ROTATING_STATUSES
+
+        if not statuses:
+            LOGGER.warning(
+                "Status phrases file %s did not contain any usable statuses; using defaults.",
+                path,
+            )
+            return DEFAULT_ROTATING_STATUSES
+
+        LOGGER.info("Loaded %s custom rotating statuses from %s.", len(statuses), path)
+        return statuses
 
     async def _status_rotation_loop(self) -> None:
         await self.wait_until_ready()
@@ -1078,7 +794,7 @@ class ReaderBot(commands.Bot):
 
     async def _rotate_status(self) -> None:
         next_status = choose_next_status(
-            DEFAULT_ROTATING_STATUSES,
+            self._rotating_statuses,
             rng=self._status_random,
             current=self._current_status,
         )
@@ -1265,26 +981,6 @@ class ReaderBot(commands.Bot):
         limit = model_spec.scaled_rate_limit(self.config.global_rate_limit_count)
         return self.global_rate_limiter.status("global", limit=limit)
 
-    def _format_batch_channel_label(self, message: discord.Message) -> str:
-        guild = message.guild
-        if guild is None:
-            return "#unknown"
-        return self._format_scope_label(guild, message.channel.id)
-
-    def _format_batch_timestamp(self, created_at: datetime) -> str:
-        return created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
-
-    def _format_batch_context_line(
-        self,
-        message: discord.Message,
-        *,
-        content: str,
-    ) -> str:
-        return (
-            f"{self._format_batch_timestamp(message.created_at)} | "
-            f"{self._display_name_for_batch_model(message.author)}: {content}"
-        )
-
     async def _maybe_add_loader_reaction(self, message: discord.Message) -> bool:
         emoji = discord.PartialEmoji.from_str(LOADER_EMOJI)
         try:
@@ -1343,13 +1039,6 @@ class ReaderBot(commands.Bot):
 
         return "Unknown user"
 
-    def _display_name_for_batch_model(self, user: discord.abc.User) -> str:
-        display_name = self._display_name_for_user(user)
-        user_id = getattr(user, "id", None)
-        if isinstance(user_id, int) and self._user_is_owner(user_id):
-            return f"{display_name} [MAINTAINER]"
-        return display_name
-
     async def _tree_interaction_check(self, interaction: discord.Interaction[Any]) -> bool:
         ban = await self._get_user_ban(interaction.user.id)
         if ban is None:
@@ -1407,43 +1096,14 @@ class ReaderBot(commands.Bot):
             mention_author=False,
         )
 
-    def _strip_bot_mentions(self, content: str) -> str:
-        if self.user is None:
-            return content.strip()
-
-        mention_pattern = rf"<@!?{self.user.id}>"
-        stripped = re.sub(mention_pattern, " ", content)
-        return re.sub(r"\s+", " ", stripped).strip(" \n\t,;:-")
-
     async def _send_reply(
         self,
         message: discord.Message,
         content: str,
         *,
         model_spec: ModelSpec,
-        target_users: list[discord.abc.User],
     ) -> None:
-        allowed_mentions = None
-        prefix = ""
-        if target_users:
-            unique_users: list[discord.abc.User] = []
-            seen_user_ids: set[int] = set()
-            for user in target_users:
-                if user.id in seen_user_ids:
-                    continue
-                seen_user_ids.add(user.id)
-                unique_users.append(user)
-            if unique_users:
-                prefix = " ".join(user.mention for user in unique_users)
-                allowed_mentions = discord.AllowedMentions(
-                    everyone=False,
-                    roles=False,
-                    users=unique_users,
-                    replied_user=False,
-                )
-
-        full_content = f"{prefix}\n{content}" if prefix else content
-        chunks = self._chunk_message(full_content)
+        chunks = self._chunk_message(content)
         if not chunks:
             chunks = ["I somehow managed to say nothing. Impressive, but not useful."]
 
@@ -1451,7 +1111,6 @@ class ReaderBot(commands.Bot):
         sent_message = await message.reply(
             chunks[0],
             mention_author=False,
-            allowed_mentions=allowed_mentions,
             view=view,
         )
         view.message = sent_message
@@ -1714,7 +1373,7 @@ class ReaderBot(commands.Bot):
                 )
                 return
 
-            await interaction.response.defer(thinking=True)
+            await interaction.response.defer(thinking=True, ephemeral=True)
 
             if self.http_session is None:
                 await interaction.followup.send(
@@ -1722,13 +1381,14 @@ class ReaderBot(commands.Bot):
                         title="Failed To Update Cache",
                         description="The HTTP session is not ready yet.",
                         color=discord.Color.red(),
-                    )
+                    ),
+                    ephemeral=True,
                 )
                 return
 
             result = await self.docs_cache.maybe_refresh(self.http_session, force=True)
             embed = self._cache_result_to_embed(result)
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
         @self.tree.command(
             name="inspect_channel_memory",

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 DEFAULT_MODEL_ID = "kimi"
-DEFAULT_BATCH_MODEL_ID = "gemini-fast"
 
 
 @dataclass(frozen=True, slots=True)

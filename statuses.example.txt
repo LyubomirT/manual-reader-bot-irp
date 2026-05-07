@@ -1,0 +1,7 @@
+# Optional custom rotating Discord statuses.
+# One phrase per line. Use [watching], [playing], [listening], or [custom].
+
+[watching] users ignore the search bar.
+[playing] Find the obvious blue button.
+[listening] frantic settings-menu clicking.
+[custom] Ctrl+F is my love language.

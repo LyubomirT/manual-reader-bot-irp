@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -476,7 +477,7 @@ class DocsCacheManager:
         return "\n\n".join(paragraphs)
 
     def _initialize_database(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 """
@@ -490,7 +491,7 @@ class DocsCacheManager:
             connection.commit()
 
     def _replace_pages_sync(self, pages: list[CachedDocPage]) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute("DELETE FROM docs_pages")
             connection.executemany(
                 """
@@ -502,7 +503,7 @@ class DocsCacheManager:
             connection.commit()
 
     def _load_pages_sync(self) -> list[CachedDocPage]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
                 SELECT page_url, title, page_text

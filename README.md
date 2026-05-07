@@ -6,7 +6,6 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 
 - Mention/reply driven chat in public channels
 - Per-user model preferences with a reply button picker and `/model`
-- Optional batched auto-triage every 30 seconds for likely docs/setup questions in normal chat
 - Slash commands for `/help`, `/model`, `/rate_limit_status`, `/update_cache`, and `/clear_memory`
 - Admin memory inspection via `/inspect_channel_memory` and `/inspect_memory_global`
 - Admin user blocking via `/ban_user` and `/unban_user`
@@ -15,8 +14,8 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 - Full normalized docs pages cached locally in SQLite
 - Per-channel/thread and global rate limiting
 - Per-channel/thread conversation memory with 1 hour inactivity expiry
-- Random rotating bot statuses with a configurable update interval
-- Persistent user bans, including AI-triggered auto-blocks on obvious abuse/spam
+- Random rotating bot statuses with a configurable update interval and optional text file override
+- Persistent user bans, with optional AI-triggered auto-blocks on obvious abuse/spam
 - Role and guild gating so the bot only works where it should
 
 ## Requirements
@@ -45,8 +44,6 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
-For a fresh server deployment, see [docs/ubuntu-24.04-vps-setup.md](docs/ubuntu-24.04-vps-setup.md).
-
 ## Environment Variables
 
 The main options live in `.env.example`. The important ones are:
@@ -55,14 +52,13 @@ The main options live in `.env.example`. The important ones are:
 - `POLLINATIONS_API_KEY`
 - `POLLINATIONS_MODEL`
 - `POLLINATIONS_SELECTOR_MODEL`
-- `POLLINATIONS_BATCH_MODEL`
 - `COMMAND_GUILD_ID`
 - `ALLOWED_GUILD_ID`
 - `ALLOWED_ROLE_ID`
 - `BOT_OWNER_USER_ID`
-- `AUTO_REPLY_ENABLED`
+- `AI_TRIGGERED_BANS_ENABLED`
 - `STATUS_ROTATION_INTERVAL_SECONDS`
-- `AUTO_REPLY_BATCH_INTERVAL_SECONDS`
+- `STATUS_PHRASES_FILE`
 - rate limit settings
 - conversation memory settings
 - docs cache / selector settings
@@ -86,11 +82,12 @@ The main options live in `.env.example`. The important ones are:
 - Blocked users cannot chat with the bot or use any slash commands.
 - DMs are rejected.
 - AI replies include a small model/status view with a model-picker button.
-- The bot can proactively answer likely docs/setup questions it spots in public chat after batched triage when `AUTO_REPLY_ENABLED=true`.
 - Replies are plain text; system slash command responses use embeds.
+- Admin inspection and cache-refresh command responses are ephemeral.
 - Docs retrieval now uses a model-assisted page selector over the full cached docs corpus.
 - The LLM is instructed not to reveal reasoning traces.
-- The LLM may auto-block users by returning the internal `[ban_user]` sentinel for obvious abuse, spam, or token-wasting nonsense.
+- If `AI_TRIGGERED_BANS_ENABLED=true`, the LLM may auto-block users by returning the internal `[ban_user]` sentinel for obvious abuse, spam, or token-wasting nonsense.
+- Set `STATUS_PHRASES_FILE` to a text file path to override rotating statuses. Each non-comment line is one phrase, optionally prefixed with `[watching]`, `[playing]`, `[listening]`, or `[custom]`; see `statuses.example.txt`.
 
 ## Data Files
 
@@ -100,8 +97,3 @@ Runtime data is stored under `data/` by default:
 - `data/reader.sqlite3`
 
 Both are ignored by git.
-
-## Extra Docs
-
-- Deployment guide: [docs/ubuntu-24.04-vps-setup.md](docs/ubuntu-24.04-vps-setup.md)
-- Feature ideas: [docs/feature-ideas.md](docs/feature-ideas.md)

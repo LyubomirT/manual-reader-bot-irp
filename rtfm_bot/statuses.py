@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Sequence
 
 StatusKind = Literal["watching", "playing", "listening", "custom"]
+VALID_STATUS_KINDS = {"watching", "playing", "listening", "custom"}
+STATUS_LINE_PATTERN = re.compile(r"^\[([a-zA-Z_-]+)\]\s*(.*)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,3 +84,34 @@ def choose_next_status(
 
     candidates = tuple(status for status in available if status != current)
     return rng.choice(candidates or available)
+
+
+def parse_status_line(line: str) -> BotStatusSpec | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    kind: StatusKind = "custom"
+    text = stripped
+
+    match = STATUS_LINE_PATTERN.match(stripped)
+    if match:
+        raw_kind = match.group(1).casefold()
+        if raw_kind not in VALID_STATUS_KINDS:
+            return None
+        kind = raw_kind  # type: ignore[assignment]
+        text = match.group(2).strip()
+
+    if not text:
+        return None
+
+    return BotStatusSpec(kind=kind, text=text)
+
+
+def load_statuses_from_file(path: Path) -> tuple[BotStatusSpec, ...]:
+    statuses = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        status = parse_status_line(line)
+        if status is not None:
+            statuses.append(status)
+    return tuple(statuses)

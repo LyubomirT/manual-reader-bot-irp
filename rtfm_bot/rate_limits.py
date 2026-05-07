@@ -25,9 +25,6 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self._events: dict[str | int, deque[float]] = defaultdict(deque)
 
-    def retry_after(self, key: str | int, *, limit: int | None = None) -> int:
-        return self.status(key, limit=limit).retry_after
-
     def status(self, key: str | int, *, limit: int | None = None) -> RateLimitStatus:
         now = time.monotonic()
         bucket = self._events[key]
