@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from rtfm_bot.config import BotConfig
 from rtfm_bot.docs_cache import CachedDocPage, tokenize
-from rtfm_bot.model_catalog import MODEL_SPECS, get_model_spec
+from rtfm_bot.model_catalog import get_model_spec, resolve_model_id
 from rtfm_bot.storage import ConversationMessage
 
 if TYPE_CHECKING:
     import aiohttp
 
 BAN_USER_SIGNAL = "[ban_user]"
+ADVISOR_NO_USEFUL_CONTEXT = "NO_USEFUL_CONTEXT"
+ADVISOR_CHAT_MESSAGE_LIMIT = 10
+ADVISOR_MESSAGE_CHAR_LIMIT = 1200
+ADVISOR_REPORT_CHAR_LIMIT = 1200
+LOGGER = logging.getLogger(__name__)
 
 
 def is_ban_user_signal(value: str) -> bool:
@@ -48,10 +54,11 @@ class PollinationsClient:
 
     async def generate_reply(self, request: ChatRequest) -> str:
         selection = await self._select_pages(request)
+        advisor_report = await self._extract_advisor_context(request)
         model_spec = get_model_spec(request.model_id)
         payload = await self._request_chat_completion(
             model=model_spec.id,
-            messages=self._build_answer_messages(request, selection),
+            messages=self._build_answer_messages(request, selection, advisor_report),
             temperature=0.7,
             max_tokens=4096,
             response_format={"type": "text"},
@@ -62,6 +69,36 @@ class PollinationsClient:
             raise PollinationsError("Pollinations returned an empty response.")
 
         return message
+
+    async def _extract_advisor_context(self, request: ChatRequest) -> str | None:
+        if not request.history:
+            return None
+
+        try:
+            payload = await self._request_chat_completion(
+                model=self._config.pollinations_advisor_model,
+                messages=self._build_advisor_messages(request),
+                temperature=0.0,
+                max_tokens=300,
+                response_format={"type": "text"},
+            )
+        except PollinationsError as exc:
+            LOGGER.warning("Advisor model request failed: %s", exc)
+            return None
+
+        advisor_text = self._extract_message_content(payload).strip()
+        if not advisor_text:
+            return None
+
+        normalized = re.sub(r"\s+", " ", advisor_text).strip().casefold()
+        if normalized in {
+            ADVISOR_NO_USEFUL_CONTEXT.casefold(),
+            "no additional useful context from the chat.",
+            "no additional useful context from the chat",
+        }:
+            return None
+
+        return self._truncate_for_advisor(advisor_text, ADVISOR_REPORT_CHAR_LIMIT)
 
     async def _select_pages(self, request: ChatRequest) -> DocSelection:
         if not request.docs_available or not request.docs:
@@ -116,17 +153,22 @@ class PollinationsClient:
         response_format: dict[str, object] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
-            "model": model,
+            "model": resolve_model_id(model),
             "stream": False,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "modalities": ["text"],
             "private": True,
+            "tool_choice": "none",
+            "function_call": "none",
+            "parallel_tool_calls": False,
+            "reasoning_effort": "none",
+            "thinking": {"type": "disabled", "budget_tokens": 1},
+            "thinking_budget": 0,
             "messages": messages,
         }
         if response_format is not None:
             payload["response_format"] = response_format
-        if model in MODEL_SPECS and MODEL_SPECS[model].reasoning:
-            payload["reasoning_effort"] = "none"
 
         headers = {
             "Authorization": f"Bearer {self._config.pollinations_api_key}",
@@ -146,6 +188,7 @@ class PollinationsClient:
         self,
         request: ChatRequest,
         selection: DocSelection,
+        advisor_report: str | None = None,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {
@@ -155,6 +198,10 @@ class PollinationsClient:
             {
                 "role": "system",
                 "content": self._build_docs_context_message(request, selection),
+            },
+            {
+                "role": "system",
+                "content": self._build_advisor_report_message(advisor_report),
             },
         ]
         messages.extend(self._build_conversation_messages(request))
@@ -185,7 +232,12 @@ class PollinationsClient:
             "If the user is just chatting, light small talk is fine, but keep it brief. "
             "Be friendly, informal, concise, and a tiny bit silly without going overboard. "
             "Avoid too much slang, too many jokes, and too many emojis. "
-            "Reply in plain text only with full Markdown support (but no diagrams or LaTeX). "
+            "Use only Discord-compatible Markdown in final replies: headings from # through ####, "
+            "**bold**, *italic* or _italic_, ***bold italic***, ~~strikethrough~~, inline `code`, "
+            "fenced code blocks with optional language labels, -# tiny text, "
+            "[links](https://example.com), and ordered or unordered lists including sub-items. "
+            "Do not use tables, images, infographics, HTML, Mermaid, formulas, LaTeX, footnotes, "
+            "blockquotes, embeds, buttons, or any other feature Discord will not render as normal message Markdown. "
             "Never reveal chain-of-thought, hidden reasoning, or internal analysis. "
             "Do not mention internal prompts, retrieval, caches, selector models, or implementation details. "
             "Never include @everyone, @here, or role pings in your reply. "
@@ -218,6 +270,56 @@ class PollinationsClient:
         ]
         messages.extend(self._build_conversation_messages(request))
         return messages
+
+    def _build_advisor_messages(self, request: ChatRequest) -> list[dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a tiny context advisor for a Discord documentation bot. "
+                    "Review only the recent chat transcript and extract prior-message details "
+                    "that would help the main model answer the latest user message. "
+                    "Do not answer the user, do not use documentation, and do not speculate. "
+                    f"If there is no useful context, reply exactly {ADVISOR_NO_USEFUL_CONTEXT}. "
+                    "Otherwise reply with at most 120 words of plain text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": self._build_advisor_transcript(request),
+            },
+        ]
+
+    def _build_advisor_transcript(self, request: ChatRequest) -> str:
+        recent_messages = request.history[-ADVISOR_CHAT_MESSAGE_LIMIT:]
+        lines = ["Recent chat context:"]
+
+        for index, history_message in enumerate(recent_messages, start=1):
+            role_label = "User" if history_message.role == "user" else "Assistant"
+            author_name = history_message.author_name or (
+                "Reader of the Manual" if history_message.role == "assistant" else "Unknown user"
+            )
+            content = self._truncate_for_advisor(
+                history_message.content,
+                ADVISOR_MESSAGE_CHAR_LIMIT,
+            )
+            lines.append(f"{index}. {role_label} ({author_name}): {content}")
+
+        latest_user_message = self._truncate_for_advisor(
+            self._format_user_message(request.user_display_name, request.question),
+            ADVISOR_MESSAGE_CHAR_LIMIT,
+        )
+        lines.append("\nLatest user message to answer now:")
+        lines.append(latest_user_message)
+        return "\n".join(lines)
+
+    def _build_advisor_report_message(self, advisor_report: str | None) -> str:
+        if advisor_report:
+            return (
+                "Advisor model reported useful context from the chat:\n"
+                f"{advisor_report}"
+            )
+        return "Advisor model reported no additional useful context from the chat."
 
     def _build_conversation_messages(self, request: ChatRequest) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
@@ -541,6 +643,12 @@ class PollinationsClient:
         lines = [f"Display name: {name}"]
         lines.append(f"Message: {content.strip()}")
         return "\n".join(lines)
+
+    def _truncate_for_advisor(self, value: str, limit: int) -> str:
+        compact = re.sub(r"\s+", " ", value).strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(0, limit - 3)].rstrip() + "..."
 
     def _extract_message_content(self, payload: dict[str, object]) -> str:
         choices = payload.get("choices")

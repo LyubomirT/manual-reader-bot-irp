@@ -55,6 +55,7 @@ class BotConfig:
     pollinations_api_key: str
     pollinations_model: str
     pollinations_selector_model: str
+    pollinations_advisor_model: str
     pollinations_base_url: str
     command_guild_id: int | None
     allowed_guild_id: int
@@ -99,9 +100,14 @@ class BotConfig:
         return cls(
             discord_bot_token=_read_required_env("DISCORD_BOT_TOKEN"),
             pollinations_api_key=_read_required_env("POLLINATIONS_API_KEY"),
-            pollinations_model=os.getenv("POLLINATIONS_MODEL", "kimi").strip() or "kimi",
+            pollinations_model=os.getenv("POLLINATIONS_MODEL", "glm").strip() or "glm",
             pollinations_selector_model=(
-                os.getenv("POLLINATIONS_SELECTOR_MODEL", "openai").strip() or "openai"
+                os.getenv("POLLINATIONS_SELECTOR_MODEL", "gpt-5.4-mini").strip()
+                or "gpt-5.4-mini"
+            ),
+            pollinations_advisor_model=(
+                os.getenv("POLLINATIONS_ADVISOR_MODEL", "openai").strip()
+                or "openai"
             ),
             pollinations_base_url=(
                 os.getenv("POLLINATIONS_BASE_URL", "https://gen.pollinations.ai/v1").rstrip("/")

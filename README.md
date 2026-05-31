@@ -16,7 +16,8 @@ Discord bot for the IntenseRP Next server. It answers docs questions when users 
 - Admin memory inspection via `/inspect_channel_memory` and `/inspect_memory_global`
 - Admin user blocking via `/ban_user` and `/unban_user`
 - Disk-backed docs cache refreshed on startup and every 6 hours
-- Two-stage docs retrieval: `openai` selects relevant cached pages, then `kimi` answers with full page context
+- Two-stage docs retrieval: `gpt-5.4-mini` selects relevant cached pages, then the user's chosen model answers with full page context
+- Tiny `openai` advisor pass over recent chat memory to surface useful context before the final answer
 - Full normalized docs pages cached locally in SQLite
 - Per-channel/thread and global rate limiting
 - Per-channel/thread conversation memory with 1 hour inactivity expiry
@@ -58,6 +59,7 @@ The main options live in `.env.example`. The important ones are:
 - `POLLINATIONS_API_KEY`
 - `POLLINATIONS_MODEL`
 - `POLLINATIONS_SELECTOR_MODEL`
+- `POLLINATIONS_ADVISOR_MODEL`
 - `COMMAND_GUILD_ID`
 - `ALLOWED_GUILD_ID`
 - `ALLOWED_ROLE_ID`
@@ -88,9 +90,10 @@ The main options live in `.env.example`. The important ones are:
 - Blocked users cannot chat with the bot or use any slash commands.
 - DMs are rejected.
 - AI replies include a small model/status view with a model-picker button.
-- Replies are plain text; system slash command responses use embeds.
+- AI replies are limited to Discord-compatible Markdown; system slash command responses use embeds.
 - Admin inspection and cache-refresh command responses are ephemeral.
 - Docs retrieval now uses a model-assisted page selector over the full cached docs corpus.
+- The final answer also gets a best-effort advisor summary from the last few saved chat messages.
 - The LLM is instructed not to reveal reasoning traces.
 - If `AI_TRIGGERED_BANS_ENABLED=true`, the LLM may auto-block users by returning the internal `[ban_user]` sentinel for obvious abuse, spam, or token-wasting nonsense.
 - Set `STATUS_PHRASES_FILE` to a text file path to override rotating statuses. Each non-comment line is one phrase, optionally prefixed with `[watching]`, `[playing]`, `[listening]`, or `[custom]`; see `statuses.example.txt`.

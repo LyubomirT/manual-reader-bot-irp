@@ -29,6 +29,9 @@ class BotConfigTests(unittest.TestCase):
             config = BotConfig.from_env()
 
         self.assertFalse(config.ai_triggered_bans_enabled)
+        self.assertEqual(config.pollinations_model, "glm")
+        self.assertEqual(config.pollinations_selector_model, "gpt-5.4-mini")
+        self.assertEqual(config.pollinations_advisor_model, "openai")
 
     def test_ai_triggered_bans_accept_true(self) -> None:
         env = self._base_env()
