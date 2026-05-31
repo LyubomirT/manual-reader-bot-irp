@@ -157,14 +157,7 @@ class PollinationsClient:
             "stream": False,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "modalities": ["text"],
             "private": True,
-            "tool_choice": "none",
-            "function_call": "none",
-            "parallel_tool_calls": False,
-            "reasoning_effort": "none",
-            "thinking": {"type": "disabled", "budget_tokens": 1},
-            "thinking_budget": 0,
             "messages": messages,
         }
         if response_format is not None:

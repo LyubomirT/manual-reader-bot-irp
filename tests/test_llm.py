@@ -183,7 +183,7 @@ class PollinationsRequestTests(unittest.IsolatedAsyncioTestCase):
             pollinations_advisor_model="openai",
         )
 
-    async def test_chat_completion_payload_disables_non_text_features(self) -> None:
+    async def test_chat_completion_payload_stays_openai_compatible(self) -> None:
         session = FakePollinationsSession()
         client = PollinationsClient(self._make_config(), session=session)
 
@@ -197,12 +197,15 @@ class PollinationsRequestTests(unittest.IsolatedAsyncioTestCase):
 
         payload = session.calls[0]["json"]
         self.assertEqual(payload["model"], "glm")
-        self.assertEqual(payload["modalities"], ["text"])
-        self.assertEqual(payload["tool_choice"], "none")
-        self.assertEqual(payload["function_call"], "none")
-        self.assertFalse(payload["parallel_tool_calls"])
-        self.assertEqual(payload["reasoning_effort"], "none")
-        self.assertEqual(payload["thinking_budget"], 0)
+        self.assertEqual(payload["stream"], False)
+        self.assertEqual(payload["private"], True)
+        self.assertNotIn("modalities", payload)
+        self.assertNotIn("tool_choice", payload)
+        self.assertNotIn("function_call", payload)
+        self.assertNotIn("parallel_tool_calls", payload)
+        self.assertNotIn("reasoning_effort", payload)
+        self.assertNotIn("thinking", payload)
+        self.assertNotIn("thinking_budget", payload)
         self.assertEqual(payload["response_format"], {"type": "text"})
 
     async def test_chat_completion_payload_passes_openai_advisor_id_through(self) -> None:
